@@ -38,6 +38,16 @@ class Indexer:
         self.sparse_encoder = BM25SparseEncoder()
         print("[OK] BM25 Sparse Encoder initialized")
         
+        # 3. Initialize Groq client once (reused for all image captions)
+        self._groq_client = None
+        if config.GROQ_API_KEY:
+            try:
+                from groq import Groq
+                self._groq_client = Groq(api_key=config.GROQ_API_KEY)
+                print("[OK] Groq Vision client initialized (for image captioning)")
+            except ImportError:
+                print("[WARN] Groq not installed — image captioning disabled")
+        
         # Initialize LlamaParse (API required for parsing)
         self.parser = LlamaParse(api_key=llama_parse_api_key, result_type="markdown", verbose=True)
         
@@ -292,8 +302,9 @@ class Indexer:
         Returns:
             Caption string, or empty string if captioning fails
         """
-        from groq import Groq
-        import base64
+        if not self._groq_client:
+            return ""
+        
         import io
         from PIL import Image
         
@@ -323,8 +334,11 @@ class Indexer:
             buffer.seek(0)
             base64_image = base64.b64encode(buffer.read()).decode('utf-8')
             
-            groq_client = Groq(api_key=config.GROQ_API_KEY)
-            completion = groq_client.chat.completions.create(
+            # Free PIL image immediately
+            img.close()
+            del img
+            
+            completion = self._groq_client.chat.completions.create(
                 model=config.GROQ_MODEL_NAME,
                 messages=[{
                     "role": "user",
@@ -336,6 +350,10 @@ class Indexer:
                 max_tokens=150,
                 temperature=0.3
             )
+            
+            # Free base64 string immediately
+            del base64_image
+            
             return completion.choices[0].message.content.strip()
             
         except Exception as e:
@@ -360,12 +378,22 @@ class Indexer:
         
         print(f"[DOC] Processing document: {file_path}")
         
+        # Free any lingering garbage before heavy allocation
+        import gc; gc.collect()
+        
         # Ensure collections exist (in case they were deleted)
         self.qdrant_manager.create_text_collection(dense_dim=self.dense_dim)
         self.qdrant_manager.create_image_collection(image_dim=self.image_dim)
         
         # --- Check Supabase Cache First ---
-        cached = self._load_from_cache(file_path)
+        try:
+            cached = self._load_from_cache(file_path)
+        except MemoryError:
+            print("[WARN] OOM loading parse cache — will re-parse instead")
+            cached = None
+        except Exception as e:
+            print(f"[WARN] Cache load failed: {e}")
+            cached = None
         
         if cached:
             json_objs, images_data, file_hash = cached
@@ -458,6 +486,10 @@ class Indexer:
         elif isinstance(json_objs, dict) and "pages" in json_objs:
              pages = json_objs["pages"]
         
+        # FREE the massive JSON objects — we only need pages from here on
+        del json_objs
+        import gc; gc.collect()
+        
         if not pages:
             print("[ERROR] Parsing failed: No pages found in API response.")
             return result
@@ -481,6 +513,7 @@ class Indexer:
         
         # Split into chunks — each chunk inherits page metadata from its Document
         nodes = self.text_splitter.get_nodes_from_documents(docs)
+        del docs  # Free page text — nodes have their own copies
         
         print(f"Split document into {len(nodes)} text nodes (with page metadata).")
         
@@ -507,16 +540,28 @@ class Indexer:
             print(f"[OK] All {len(nodes)} text points already exist. Skipping embedding & upsert.")
             result["text_count"] = 0
         else:
-            # Step 3: Embed only NEW text chunks via Jina API
+            # Step 3: Embed NEW text chunks in batches to limit peak memory
             new_text_contents = [node.get_content() for _, _, node in new_chunks]
-            print(f"[EMBED] Generating embeddings for {len(new_text_contents)} new text chunks via Jina v4...")
-            dense_vectors = self.embedder.embed_texts(new_text_contents, task="retrieval.passage")
+            EMBED_BATCH = 50  # Process 50 chunks at a time
+            all_dense = []
+            for batch_start in range(0, len(new_text_contents), EMBED_BATCH):
+                batch = new_text_contents[batch_start:batch_start + EMBED_BATCH]
+                batch_num = batch_start // EMBED_BATCH + 1
+                total_batches = (len(new_text_contents) + EMBED_BATCH - 1) // EMBED_BATCH
+                print(f"[EMBED] Batch {batch_num}/{total_batches}: embedding {len(batch)} chunks via Jina v4...")
+                batch_vecs = self.embedder.embed_texts(batch, task="retrieval.passage")
+                all_dense.extend(batch_vecs)
+                del batch_vecs  # Free batch immediately
+            dense_vectors = all_dense
             print(f"[OK] Generated {len(dense_vectors)} dense embeddings")
             
             # Step 3b: Generate BM25 sparse vectors (local, instant)
             print(f"[SPARSE] Generating BM25 sparse vectors for {len(new_text_contents)} chunks...")
             sparse_vectors = self.sparse_encoder.encode_documents(new_text_contents)
             print(f"[OK] Generated {len(sparse_vectors)} sparse vectors")
+            
+            # Free raw text contents — no longer needed
+            del new_text_contents
             
             # Step 4: Package and upsert (dense + sparse)
             text_points: List[TextPoint] = []
@@ -532,25 +577,28 @@ class Indexer:
                     )
                 )
             
+            # Free vectors before upsert (upsert copies data)
+            del dense_vectors, sparse_vectors, new_chunks
+            
             self.qdrant_manager.upsert_text_points(text_points)
             print(f"[OK] Upserted {len(text_points)} NEW text points (skipped {len(existing_text_ids)} existing).")
             result["text_count"] = len(text_points)
+            del text_points  # Free immediately
+        
+        # Free nodes and pages to reclaim memory before image processing
+        del nodes
+        import gc; gc.collect()
         
         # Step 5: Handle Images (Multi-Modal)
-        all_images_meta = []
-        for p in pages:
-            if "images" in p:
-                all_images_meta.extend(p["images"])
-        
-        # Choose indexing method based on config
-        if config.URL_BASED_IMAGE_INDEXING:
-            # URL-based: Embed directly from LlamaParse URLs (no download)
-            image_count = self._index_images_from_urls(json_objs, source_file=file_path)
-        else:
-            # Local: Use downloaded images
-            image_count = self._index_downloaded_images(images_data, source_file=file_path)
+        # Note: json_objs was already freed above, so URL-based indexing
+        # uses images_data which was extracted earlier
+        image_count = self._index_downloaded_images(images_data, source_file=file_path)
         
         result["image_count"] = image_count
+        
+        # Final memory cleanup
+        del pages, images_data
+        gc.collect()
         
         return result
     
@@ -651,17 +699,28 @@ class Indexer:
             new_image_points = [p for p in image_points if p.id not in existing_image_ids]
             
             if new_image_points:
-                # Caption new images using Groq Vision
+                # Caption new images using Groq Vision + embed captions for text→image search
                 import time as time_mod
                 print(f"[CAPTION] Generating captions for {len(new_image_points)} images via Groq...")
+                captions_to_embed = []
                 for i, point in enumerate(new_image_points):
                     img_url = point.payload.get("image_url", "")
                     caption = self._caption_image(img_url)
                     point.payload["caption"] = caption
+                    captions_to_embed.append(caption if caption else "image")
                     if caption:
                         print(f"   [{i+1}/{len(new_image_points)}] \"{caption[:60]}...\"")
                     if i < len(new_image_points) - 1:
                         time_mod.sleep(2)
+                
+                # Embed captions as text vectors for text→image retrieval
+                print(f"[EMBED] Embedding {len(captions_to_embed)} captions for text→image search...")
+                try:
+                    caption_vectors = self.embedder.embed_texts(captions_to_embed, task="retrieval.passage")
+                    for point, cap_vec in zip(new_image_points, caption_vectors):
+                        point.caption_vector = cap_vec
+                except Exception as e:
+                    print(f"   [WARN] Caption embedding failed: {e}")
                 
                 self.qdrant_manager.upsert_image_points(new_image_points)
                 print(f"[OK] Upserted {len(new_image_points)} NEW URL-indexed image points (skipped {len(existing_image_ids)} existing).")

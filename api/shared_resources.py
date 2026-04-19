@@ -299,9 +299,9 @@ class SharedResources:
 # =============================================================================
 
 # Create a dedicated thread pool that won't compete with uvicorn workers
-# max_workers=2 limits concurrent indexing to prevent memory exhaustion
+# max_workers=1 limits concurrent indexing to prevent memory exhaustion on Render
 INDEXING_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
-    max_workers=2,
+    max_workers=1,
     thread_name_prefix="indexer_"
 )
 
