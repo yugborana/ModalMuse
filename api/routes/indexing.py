@@ -114,6 +114,14 @@ def index_document_sync(file_path: str, task_id: str) -> None:
             from_cache=result.get("from_cache", False)
         )
         
+        # Invalidate semantic response cache (answers may be stale)
+        try:
+            from qdrant_manager import QdrantManager
+            q = QdrantManager(url=config.QDRANT_URL, api_key=config.QDRANT_API_KEY)
+            q.clear_response_cache()
+        except Exception as cache_err:
+            print(f"[WARN] Could not clear response cache: {cache_err}")
+        
         print(f"[OK] Task {task_id[:8]}... completed: {result}")
         
     except Exception as e:
@@ -250,17 +258,23 @@ async def get_collection_stats():
     """
     import httpx
     
+    headers = {}
+    if config.QDRANT_API_KEY:
+        headers["api-key"] = config.QDRANT_API_KEY
+    
     async with httpx.AsyncClient() as client:
         try:
             # Get text collection stats
             text_response = await client.get(
-                f"{config.QDRANT_URL}/collections/{config.TEXT_COLLECTION_NAME}"
+                f"{config.QDRANT_URL}/collections/{config.TEXT_COLLECTION_NAME}",
+                headers=headers
             )
             text_data = text_response.json() if text_response.status_code == 200 else {"error": "Not found"}
             
             # Get image collection stats
             image_response = await client.get(
-                f"{config.QDRANT_URL}/collections/{config.IMAGE_COLLECTION_NAME}"
+                f"{config.QDRANT_URL}/collections/{config.IMAGE_COLLECTION_NAME}",
+                headers=headers
             )
             image_data = image_response.json() if image_response.status_code == 200 else {"error": "Not found"}
             

@@ -328,6 +328,7 @@ async def get_query_engine():
     
     Uses double-checked locking to prevent race conditions when
     multiple requests try to initialize the engine simultaneously.
+    Resets on failure so the next connection can retry cleanly.
     """
     global _query_engine
     import asyncio
@@ -338,9 +339,13 @@ async def get_query_engine():
                 # Import here to avoid circular imports and delays at startup
                 from retriever import create_query_engine
                 
-                # Run initialization in thread pool to avoid blocking
-                loop = asyncio.get_event_loop()
-                _query_engine = await loop.run_in_executor(None, create_query_engine)
+                try:
+                    # Run initialization in thread pool to avoid blocking
+                    loop = asyncio.get_event_loop()
+                    _query_engine = await loop.run_in_executor(None, create_query_engine)
+                except Exception as e:
+                    _query_engine = None  # Ensure next connection retries
+                    raise RuntimeError(f"Query engine initialization failed: {e}") from e
     
     return _query_engine
 

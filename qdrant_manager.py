@@ -1,5 +1,5 @@
 from typing import List, Dict, Any, Optional
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from qdrant_client import QdrantClient, AsyncQdrantClient, models
 from qdrant_client.http.models import SparseVector
 from llama_index.vector_stores.qdrant import QdrantVectorStore
@@ -8,15 +8,14 @@ from llama_index.vector_stores.qdrant import QdrantVectorStore
 PointID = str 
 
 @dataclass
-class HybridPoint:
-    """A data structure to hold all information for a single Qdrant point."""
+class TextPoint:
+    """A data structure to hold all information for a single Qdrant text point."""
     id: PointID
     text_chunk: str
     dense_vector: List[float]
-    sparse_vector_indices: List[int]
-    sparse_vector_values: List[float]
-    # Payload for the text point
-    payload: Dict[str, Any] 
+    sparse_indices: List[int] = field(default_factory=list)
+    sparse_values: List[float] = field(default_factory=list)
+    payload: Dict[str, Any] = field(default_factory=dict)
 
 @dataclass
 class ImagePoint:
@@ -24,13 +23,13 @@ class ImagePoint:
     id: PointID
     image_path: str
     image_vector: List[float]
-    # Payload for the image point
-    payload: Dict[str, Any]
+    caption_vector: List[float] = field(default_factory=list)  # Text embedding of caption for text→image search
+    payload: Dict[str, Any] = field(default_factory=dict)
 
 # qdrant_manager.py (Continuation)
 
 class QdrantManager:
-    """Manages Qdrant client, collections, and hybrid/multi-modal upserts."""
+    """Manages Qdrant client, collections, and multi-modal upserts."""
     
     def __init__(self, url: Optional[str] = "http://localhost:6333", api_key: Optional[str] = None, timeout: int = 60):
         # Sync client for indexing and sync operations
@@ -42,8 +41,8 @@ class QdrantManager:
 
     # --- Collection Management ---
 
-    def create_text_collection(self, dense_dim: int, sparse_dim: int):
-        """Creates the text collection configured for BGE (dense) and SPLADE (sparse)."""
+    def create_text_collection(self, dense_dim: int):
+        """Creates the text collection with a dense vector index."""
         print(f"[SEARCH] Checking text collection '{self.text_collection_name}'...")
         try:
             # Check if collection already exists
@@ -62,7 +61,9 @@ class QdrantManager:
                         )
                     },
                     sparse_vectors_config={
-                        "text-sparse": models.SparseVectorParams()
+                        "text-sparse": models.SparseVectorParams(
+                            modifier=models.Modifier.IDF  # Qdrant applies IDF weighting at search time
+                        )
                     }
                 )
                 print(f"[OK] Created text collection: {self.text_collection_name}")
@@ -73,7 +74,7 @@ class QdrantManager:
             raise
 
     def create_image_collection(self, image_dim: int):
-        """Creates the image collection configured for CLIP (dense).
+        """Creates the image collection with a dense vector index.
         
         Uses get_or_create pattern to avoid destroying existing indexed data.
         """
@@ -84,42 +85,43 @@ class QdrantManager:
         if self.image_collection_name not in collection_names:
             self.client.create_collection(
                 collection_name=self.image_collection_name,
-                vectors_config=models.VectorParams(
-                    # CLIP image vector config
-                    size=image_dim, 
-                    distance=models.Distance.COSINE
-                )
+                vectors_config={
+                    "image-visual": models.VectorParams(
+                        size=image_dim,
+                        distance=models.Distance.COSINE
+                    ),
+                    "caption-text": models.VectorParams(
+                        size=image_dim,  # Same Jina model embeds both text & images
+                        distance=models.Distance.COSINE
+                    )
+                }
             )
-            print(f"[OK] Created image collection: {self.image_collection_name}")
+            print(f"[OK] Created image collection: {self.image_collection_name} (visual + caption vectors)")
         else:
             print(f"[OK] Image collection already exists: {self.image_collection_name}")
 
     # --- Upsert Logic ---
     
-    def upsert_text_points(self, points: List[HybridPoint], batch_size: int = 128):
-        """Inserts a list of HybridPoints into the text collection."""
+    def upsert_text_points(self, points: List[TextPoint], batch_size: int = 128):
+        """Inserts a list of TextPoints into the text collection."""
         
-        # Convert custom HybridPoint objects into Qdrant PointStructs
-        qdrant_points = [
-            models.PointStruct(
-                id=p.id,
-                # Key step: Define a dictionary of named vectors: 'vector' for dense, 'sparse' for sparse.
-                vector={
-                    # Dense vector (BGE) - Named implicitly as the primary vector
-                    "text-dense": p.dense_vector, 
-                    # Sparse vector (SPLADE) - Named explicitly for the sparse field
-                    "text-sparse": SparseVector(
-                        indices=p.sparse_vector_indices, 
-                        values=p.sparse_vector_values
-                    )
-                },
-                # Payload includes the original text chunk and other metadata
-                payload={**p.payload, "text_chunk": p.text_chunk}
+        qdrant_points = []
+        for p in points:
+            vectors = {"text-dense": p.dense_vector}
+            # Add sparse vector if available
+            if p.sparse_indices and p.sparse_values:
+                vectors["text-sparse"] = SparseVector(
+                    indices=p.sparse_indices,
+                    values=p.sparse_values
+                )
+            qdrant_points.append(
+                models.PointStruct(
+                    id=p.id,
+                    vector=vectors,
+                    payload={**p.payload, "text_chunk": p.text_chunk}
+                )
             )
-            for p in points
-        ]
         
-        # Use the built-in upsert method with a batch iterator for efficiency
         self.client.upload_points(
             collection_name=self.text_collection_name,
             points=qdrant_points,
@@ -163,18 +165,24 @@ class QdrantManager:
             return set()
 
     def upsert_image_points(self, points: List[ImagePoint], batch_size: int = 128):
-        """Inserts a list of ImagePoints into the image collection."""
+        """Inserts a list of ImagePoints into the image collection.
         
-        qdrant_points = [
-            models.PointStruct(
-                id=p.id,
-                # Image vector (CLIP) - Standard dense vector
-                vector=p.image_vector,
-                # Payload stores the image path, essential for the VLM later
-                payload={**p.payload, "image_path": p.image_path}
+        Each point has two named vectors:
+          - image-visual: Jina embedding of the image pixels
+          - caption-text: Jina embedding of the Groq caption (for text→image search)
+        """
+        qdrant_points = []
+        for p in points:
+            vectors = {"image-visual": p.image_vector}
+            if p.caption_vector:
+                vectors["caption-text"] = p.caption_vector
+            qdrant_points.append(
+                models.PointStruct(
+                    id=p.id,
+                    vector=vectors,
+                    payload={**p.payload, "image_path": p.image_path}
+                )
             )
-            for p in points
-        ]
         
         self.client.upload_points(
             collection_name=self.image_collection_name,
@@ -190,10 +198,7 @@ class QdrantManager:
         return QdrantVectorStore(
             client=self.client, 
             collection_name=self.text_collection_name,
-            # Explicitly name the dense vector field for LlamaIndex to use it
-            # The sparse vector is handled in retrieval.py directly via a custom retriever.
             vector_name="text-dense",
-            sparse_vector_name="text-sparse",
             text_key="text_chunk"
         )
 
@@ -204,3 +209,151 @@ class QdrantManager:
             collection_name=self.image_collection_name,
             text_key="image_path"
         )
+
+    # --- Semantic Response Cache ---
+
+    def create_response_cache_collection(self, dense_dim: int):
+        """Create or verify the response cache collection."""
+        import config
+        cache_name = config.RESPONSE_CACHE_COLLECTION
+        
+        try:
+            collections = self.client.get_collections().collections
+            collection_names = [c.name for c in collections]
+            
+            if cache_name not in collection_names:
+                self.client.create_collection(
+                    collection_name=cache_name,
+                    vectors_config=models.VectorParams(
+                        size=dense_dim,
+                        distance=models.Distance.COSINE
+                    )
+                )
+                print(f"[OK] Created response cache collection: {cache_name}")
+            else:
+                print(f"[OK] Response cache collection exists: {cache_name}")
+        except Exception as e:
+            print(f"[WARN] Could not create response cache collection: {e}")
+
+    async def search_response_cache(
+        self, query_embedding: List[float]
+    ) -> Optional[Dict[str, Any]]:
+        """Search for a semantically similar cached response.
+        
+        Returns the cached payload if similarity >= threshold, else None.
+        """
+        import config
+        from datetime import datetime, timedelta
+        
+        try:
+            results = await self.async_client.query_points(
+                collection_name=config.RESPONSE_CACHE_COLLECTION,
+                query=query_embedding,
+                limit=1,
+                with_payload=True,
+                score_threshold=config.SEMANTIC_CACHE_THRESHOLD
+            )
+            
+            if not results.points:
+                return None
+            
+            point = results.points[0]
+            payload = point.payload
+            
+            # Check TTL
+            created_at = payload.get("created_at", "")
+            if created_at:
+                created_time = datetime.fromisoformat(created_at)
+                if datetime.now() - created_time > timedelta(hours=config.SEMANTIC_CACHE_TTL_HOURS):
+                    # Expired — delete and return None
+                    try:
+                        await self.async_client.delete(
+                            collection_name=config.RESPONSE_CACHE_COLLECTION,
+                            points_selector=models.PointIdsList(points=[point.id])
+                        )
+                    except Exception:
+                        pass
+                    return None
+            
+            print(f"   [CACHE HIT] Semantic match (score={point.score:.4f}): "
+                  f"'{payload.get('query_text', '')[:40]}...'")
+            return payload
+            
+        except Exception as e:
+            # Collection might not exist yet — that's fine
+            if "not found" not in str(e).lower():
+                print(f"   [WARN] Cache search failed: {e}")
+            return None
+
+    async def store_response_cache(
+        self,
+        query_embedding: List[float],
+        query_text: str,
+        response_text: str,
+        sources: List[Dict[str, Any]]
+    ) -> None:
+        """Store a query-response pair in the semantic cache."""
+        import config
+        import uuid
+        from datetime import datetime
+        
+        try:
+            # Store the new entry
+            point_id = str(uuid.uuid4())
+            await self.async_client.upsert(
+                collection_name=config.RESPONSE_CACHE_COLLECTION,
+                points=[
+                    models.PointStruct(
+                        id=point_id,
+                        vector=query_embedding,
+                        payload={
+                            "query_text": query_text,
+                            "response": response_text,
+                            "sources": sources,
+                            "created_at": datetime.now().isoformat()
+                        }
+                    )
+                ]
+            )
+            
+            # Enforce max entries — delete oldest if over limit
+            count_result = await self.async_client.count(
+                collection_name=config.RESPONSE_CACHE_COLLECTION
+            )
+            
+            if count_result.count > config.SEMANTIC_CACHE_MAX_ENTRIES:
+                # Scroll oldest entries and delete overflow
+                overflow = count_result.count - config.SEMANTIC_CACHE_MAX_ENTRIES
+                oldest = await self.async_client.scroll(
+                    collection_name=config.RESPONSE_CACHE_COLLECTION,
+                    limit=overflow,
+                    order_by=models.OrderBy(
+                        key="created_at",
+                        direction=models.Direction.ASC
+                    ),
+                    with_payload=False,
+                    with_vectors=False
+                )
+                if oldest[0]:
+                    ids_to_delete = [p.id for p in oldest[0]]
+                    await self.async_client.delete(
+                        collection_name=config.RESPONSE_CACHE_COLLECTION,
+                        points_selector=models.PointIdsList(points=ids_to_delete)
+                    )
+                    print(f"   [CACHE] Pruned {len(ids_to_delete)} old cache entries")
+            
+            print(f"   [CACHE] Stored response for: '{query_text[:40]}...'")
+            
+        except Exception as e:
+            print(f"   [WARN] Cache store failed: {e}")
+
+    def clear_response_cache(self) -> None:
+        """Clear all cached responses (call after indexing new documents)."""
+        import config
+        try:
+            # Delete and recreate the collection
+            self.client.delete_collection(config.RESPONSE_CACHE_COLLECTION)
+            self.create_response_cache_collection(1024)  # Jina v4 dim
+            print("[CACHE] Response cache cleared (new documents indexed)")
+        except Exception as e:
+            print(f"[WARN] Could not clear response cache: {e}")

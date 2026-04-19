@@ -169,7 +169,11 @@ async def get_cached_embedding(query: str) -> Optional[List[float]]:
 
 
 async def cache_embedding(query: str, embedding: List[float], ttl_hours: int = 1) -> None:
-    """Cache a query embedding."""
+    """Cache a query embedding with automatic storage management.
+    
+    Enforces a maximum of 500 cached embeddings. When exceeded,
+    the oldest 100 entries are pruned to prevent Supabase storage bloat.
+    """
     client = get_supabase()
     if not client:
         return
@@ -180,41 +184,63 @@ async def cache_embedding(query: str, embedding: List[float], ttl_hours: int = 1
     query_hash = hashlib.md5(query.encode()).hexdigest()
     expires_at = (datetime.now() + timedelta(hours=ttl_hours)).isoformat()
     
+    # Upsert the new entry
     client.table("query_cache").upsert({
         "query_hash": query_hash,
-        "query_text": query,  # Required by schema
+        "query_text": query,
         "embedding": embedding,
         "expires_at": expires_at
     }).execute()
+    
+    # Enforce row limit — prune oldest entries if over 500
+    try:
+        count_result = client.table("query_cache").select(
+            "query_hash", count="exact"
+        ).execute()
+        
+        if count_result.count and count_result.count > 500:
+            # Get the oldest 100 entries to delete
+            oldest = client.table("query_cache").select("query_hash").order(
+                "created_at"
+            ).limit(100).execute()
+            
+            if oldest.data:
+                hashes = [r["query_hash"] for r in oldest.data]
+                client.table("query_cache").delete().in_(
+                    "query_hash", hashes
+                ).execute()
+                print(f"   [CACHE] Pruned {len(hashes)} old entries (was {count_result.count})")
+    except Exception as e:
+        print(f"   [WARN] Cache pruning failed: {e}")
 
 
-# ═══════════════════════════════════════════════════════════════════
-# TASK STATE
-# ═══════════════════════════════════════════════════════════════════
-
-async def save_task_state(task_id: str, state: Dict) -> None:
-    """Save indexing task state to Supabase."""
+async def cleanup_expired_query_cache() -> int:
+    """Delete expired query cache entries.
+    
+    Returns number of deleted rows.
+    """
     client = get_supabase()
     if not client:
-        return
+        return 0
     
-    data = {
-        "id": task_id,
-        **state,
-        "updated_at": datetime.now().isoformat()
-    }
-    
-    client.table("indexing_tasks").upsert(data).execute()
+    try:
+        result = client.rpc("cleanup_expired_cache").execute()
+        deleted = result.data if result.data else 0
+        print(f"   [CACHE] Cleaned up {deleted} expired entries")
+        return deleted
+    except Exception as e:
+        # Fallback: manual deletion if RPC doesn't exist
+        try:
+            client.table("query_cache").delete().lt(
+                "expires_at", datetime.now().isoformat()
+            ).execute()
+            print("   [CACHE] Cleaned up expired entries (manual fallback)")
+            return -1  # Unknown count
+        except Exception as e2:
+            print(f"   [WARN] Cache cleanup failed: {e2}")
+            return 0
 
 
-async def get_task_state(task_id: str) -> Optional[Dict]:
-    """Get indexing task state."""
-    client = get_supabase()
-    if not client:
-        return None
-    
-    result = client.table("indexing_tasks").select("*").eq("id", task_id).execute()
-    return result.data[0] if result.data else None
 
 
 # ═══════════════════════════════════════════════════════════════════

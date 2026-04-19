@@ -16,3 +16,4 @@ requests
 numpy
 pydantic
 pyyaml
+scikit-learn

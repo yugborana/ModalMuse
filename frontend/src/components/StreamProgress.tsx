@@ -14,9 +14,7 @@ interface StreamProgressProps {
 
 const PHASE_CONFIG = {
     embedding: { icon: '🔮', label: 'Embedding', color: '#a78bfa' },
-    search: { icon: '🔍', label: 'Search', color: '#60a5fa' },
     reranking: { icon: '⚖️', label: 'Reranking', color: '#f59e0b' },
-    fusion: { icon: '🔀', label: 'Fusion', color: '#10b981' },
     generation: { icon: '✨', label: 'Generating', color: '#b08d57' },
 };
 

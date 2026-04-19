@@ -87,6 +87,7 @@ export default function SourcesPanel({ sources, isOpen, onClose }: SourcesPanelP
                                                 <div className="absolute inset-0 bg-gradient-to-t from-black/70 to-transparent opacity-0 group-hover:opacity-100 transition-opacity flex items-end p-3">
                                                     <span className="text-xs text-white font-medium">
                                                         {(source.score * 100).toFixed(0)}% match
+                                                        {typeof source.metadata?.page === 'number' && ` · p.${source.metadata.page}`}
                                                     </span>
                                                 </div>
                                             </div>
@@ -120,7 +121,12 @@ export default function SourcesPanel({ sources, isOpen, onClose }: SourcesPanelP
                                             </div>
                                             {typeof source.metadata?.source === 'string' && source.metadata.source && (
                                                 <span className="text-xs text-[var(--text-muted)] truncate max-w-[120px]">
-                                                    {source.metadata.source.split(/[\\/]/).pop()}
+                                                    {String(source.metadata.file_name || source.metadata.source).split(/[\\/]/).pop()}
+                                                </span>
+                                            )}
+                                            {typeof source.metadata?.page === 'number' && (
+                                                <span className="text-xs px-2 py-0.5 rounded-full bg-[var(--accent-cyan)]/10 text-[var(--accent-cyan)]">
+                                                    Page {source.metadata.page}
                                                 </span>
                                             )}
                                         </div>

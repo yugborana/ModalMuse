@@ -21,7 +21,7 @@ export interface ChunkPreview {
 
 export interface PhaseEvent {
     type: 'phase';
-    phase: 'embedding' | 'search' | 'reranking' | 'fusion' | 'generation';
+    phase: 'embedding' | 'reranking' | 'generation';
     status: 'started' | 'completed';
     message: string;
     duration_ms?: number;

@@ -1,8 +1,8 @@
 # jina_client.py - Jina AI Embeddings and Reranking Client
 """
 Client for Jina AI API - handles text/image embeddings and reranking.
-Supports both sync (requests) and async (httpx) operations.
-Uses shared connection pool for performance.
+Sync methods (requests) used by indexer thread pool.
+Async methods (httpx) used by retriever pipeline.
 """
 
 import requests
@@ -71,17 +71,13 @@ class JinaEmbeddings:
         """Return embedding dimension for Qdrant collection setup."""
         return self.dimensions
     
-    # ═══════════════════════════════════════════════════════════════════
-    # SYNC METHODS (using requests)
-    # ═══════════════════════════════════════════════════════════════════
-    
     def embed_texts(
         self, 
         texts: List[str], 
         task: str = "retrieval.passage",
         late_chunking: bool = False
     ) -> List[List[float]]:
-        """Embed multiple texts (sync)."""
+        """Embed multiple texts (sync — used by indexer thread pool)."""
         data = {
             "input": texts,
             "model": "jina-embeddings-v4",
@@ -95,16 +91,12 @@ class JinaEmbeddings:
         
         return [d["embedding"] for d in response.json()["data"]]
     
-    def embed_query(self, query: str) -> List[float]:
-        """Embed a single query (sync)."""
-        return self.embed_texts([query], task="retrieval.query")[0]
-    
     def embed_images(
         self, 
         images: List[Union[str, Path]],
         is_base64: bool = False
     ) -> List[List[float]]:
-        """Embed images (sync)."""
+        """Embed images (sync — used by indexer thread pool)."""
         input_data = self._prepare_image_input(images, is_base64)
         if not input_data:
             return []
@@ -130,7 +122,7 @@ class JinaEmbeddings:
         return [d["embedding"] for d in response.json()["data"]]
     
     # ═══════════════════════════════════════════════════════════════════
-    # ASYNC METHODS (using httpx)
+    # ASYNC METHODS (using httpx — used by retriever)
     # ═══════════════════════════════════════════════════════════════════
     
     async def aembed_texts(
@@ -155,72 +147,35 @@ class JinaEmbeddings:
         return [d["embedding"] for d in response.json()["data"]]
     
     async def aembed_query(self, query: str) -> List[float]:
-        """Embed a single query (async with caching).
+        """Embed a single query (async with Supabase caching).
         
-        Uses two cache layers:
-        1. In-memory LRU cache (fast, volatile)
-        2. Supabase query_cache (slower, persistent)
+        Cache flow:
+        1. Check Supabase query_cache (persistent, TTL-based)
+        2. On miss → call Jina API → store result in Supabase
         """
-        from cache import get_query_embedding_cache
-        
-        cache = get_query_embedding_cache()
-        
-        # Check in-memory cache first (fast)
-        cached = cache.get(query)
-        if cached is not None:
-            print(f"   [CACHE HIT] In-memory cache: '{query[:40]}...'")
-            return cached
-        
-        # Check Supabase cache (persistent)
+        # Check Supabase cache
         try:
             from supabase_client import get_cached_embedding
-            supabase_cached = await get_cached_embedding(query)
-            if supabase_cached is not None:
-                print(f"   [CACHE HIT] Supabase cache: '{query[:40]}...'")
-                # Store in memory cache for faster future access
-                cache.set(query, supabase_cached)
-                return supabase_cached
+            cached = await get_cached_embedding(query)
+            if cached is not None:
+                print(f"   [CACHE HIT] '{query[:40]}...'")
+                return cached
         except Exception as e:
-            print(f"   [WARN] Supabase cache lookup failed: {e}")
+            print(f"   [WARN] Cache lookup failed: {e}")
         
-        # Compute embedding
+        # Compute embedding via Jina API
         embeddings = await self.aembed_texts([query], task="retrieval.query")
         result = embeddings[0]
         
-        # Store in both caches
-        cache.set(query, result)
-        
-        # Store in Supabase cache (async, fire-and-forget)
+        # Store in Supabase cache
         try:
             from supabase_client import cache_embedding
             await cache_embedding(query, result)
-            print(f"   [CACHE] Stored in Supabase: '{query[:40]}...'")
+            print(f"   [CACHE] Stored: '{query[:40]}...'")
         except Exception as e:
-            print(f"   [WARN] Supabase cache store failed: {e}")
+            print(f"   [WARN] Cache store failed: {e}")
         
         return result
-    
-    async def aembed_images(
-        self, 
-        images: List[Union[str, Path]],
-        is_base64: bool = False
-    ) -> List[List[float]]:
-        """Embed images (async with connection pooling)."""
-        input_data = self._prepare_image_input(images, is_base64)
-        if not input_data:
-            return []
-        
-        data = {
-            "input": input_data,
-            "model": "jina-embeddings-v4",
-            "dimensions": self.dimensions,
-        }
-        
-        client = get_async_client()
-        response = await client.post(self.API_URL, headers=self.headers, json=data)
-        response.raise_for_status()
-        
-        return [d["embedding"] for d in response.json()["data"]]
     
     # ═══════════════════════════════════════════════════════════════════
     # HELPERS
@@ -268,36 +223,6 @@ class JinaReranker:
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.api_key}",
         }
-    
-    # ═══════════════════════════════════════════════════════════════════
-    # SYNC METHOD
-    # ═══════════════════════════════════════════════════════════════════
-    
-    def rerank(
-        self, 
-        query: str, 
-        documents: List[str], 
-        top_n: int = 5
-    ) -> List[dict]:
-        """Rerank documents (sync)."""
-        if not documents:
-            return []
-        
-        data = {
-            "model": "jina-reranker-v2-base-multilingual",
-            "query": query,
-            "documents": documents,
-            "top_n": min(top_n, len(documents)),
-        }
-        
-        response = requests.post(self.API_URL, headers=self.headers, json=data)
-        response.raise_for_status()
-        
-        return response.json()["results"]
-    
-    # ═══════════════════════════════════════════════════════════════════
-    # ASYNC METHOD
-    # ═══════════════════════════════════════════════════════════════════
     
     async def arerank(
         self, 

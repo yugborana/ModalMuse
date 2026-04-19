@@ -1,7 +1,7 @@
 # api/main.py
 """
 ModalMuse API - FastAPI Application
-Multi-Modal RAG with LlamaParse + llama.cpp
+Multi-Modal RAG with LlamaParse + Groq
 """
 
 import sys
@@ -60,14 +60,14 @@ app = FastAPI(
 ModalMuse is a multi-modal Retrieval-Augmented Generation system that can:
 
 - **Index PDF documents** with text and image extraction using LlamaParse
-- **Hybrid retrieval** using BGE (dense) + SPLADE (sparse) for text, CLIP for images
-- **Generate answers** using local LLaVA model via llama.cpp
+- **Dense retrieval** using Jina v4 embeddings with Jina reranking
+- **Generate answers** using Groq LLM (Llama 4 Maverick)
 
 ### Features
 - [DOC] PDF document indexing with image extraction
-- [SEARCH] Hybrid text search (dense + sparse vectors)
-- 🖼️ Multi-modal image retrieval with CLIP
-- 🤖 Local LLM inference with LLaVA
+- [SEARCH] Dense text search with Jina reranking
+- 🖼️ Multi-modal image retrieval
+- 🤖 LLM inference with Groq
 - ⚡ Async endpoints with streaming support
 - 💬 Conversation history with Supabase
     """,
@@ -106,7 +106,7 @@ async def root():
     return {
         "name": "ModalMuse API",
         "version": "1.0.0",
-        "description": "Multi-Modal RAG with LlamaParse + llama.cpp",
+        "description": "Multi-Modal RAG with LlamaParse + Groq",
         "docs": "/docs",
         "health": "/health",
     }

@@ -228,3 +228,26 @@ async def initialize_engine():
             status_code=500,
             detail=f"Failed to initialize query engine: {sanitize_error(e)}"
         )
+
+
+@router.delete("/cache")
+async def cleanup_query_cache():
+    """
+    Purge expired query cache entries from Supabase.
+    
+    Call periodically to prevent storage bloat. Entries expire
+    based on the TTL set during caching (default 1 hour).
+    """
+    try:
+        from supabase_client import cleanup_expired_query_cache
+        deleted = await cleanup_expired_query_cache()
+        return {
+            "status": "ok",
+            "deleted": deleted,
+            "message": f"Cleaned up {deleted} expired cache entries"
+        }
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Cache cleanup failed: {sanitize_error(e)}"
+        )
