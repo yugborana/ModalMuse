@@ -26,7 +26,7 @@ JINA_RERANK_MODEL = "jina-reranker-v2-base-multilingual"
 
 # Image embedding batch configuration (Jina free tier: 100K tokens/min)
 JINA_IMAGE_BATCH_SIZE = 2      # Images per API batch (keep small — images are token-heavy)
-JINA_BATCH_DELAY_SECONDS = 20   # Delay between batches to avoid rate limit (60s window + buffer)
+JINA_BATCH_DELAY_SECONDS = 35   # Delay between batches to avoid rate limit (60s window + buffer)
 
 
 # --- Qdrant Configuration ---

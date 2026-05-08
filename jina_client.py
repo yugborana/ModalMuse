@@ -107,19 +107,28 @@ class JinaEmbeddings:
             "dimensions": self.dimensions,
         }
         
-        response = requests.post(self.API_URL, headers=self.headers, json=data)
-        
-        if response.status_code != 200:
-            # Log the actual error details
-            try:
-                error_detail = response.json()
-                print(f"[ERROR] Jina API error: {error_detail}")
-            except:
-                print(f"[ERROR] Jina API error: {response.text[:500]}")
-        
-        response.raise_for_status()
-        
-        return [d["embedding"] for d in response.json()["data"]]
+        import time
+        max_retries = 3
+        for attempt in range(max_retries):
+            response = requests.post(self.API_URL, headers=self.headers, json=data)
+            
+            if response.status_code == 429:
+                wait_time = 30 * (attempt + 1)
+                print(f"[WARN] Jina API rate limit (429). Retrying in {wait_time}s... (Attempt {attempt+1}/{max_retries})")
+                time.sleep(wait_time)
+                continue
+                
+            if response.status_code != 200:
+                try:
+                    error_detail = response.json()
+                    print(f"[ERROR] Jina API error: {error_detail}")
+                except:
+                    print(f"[ERROR] Jina API error: {response.text[:500]}")
+            
+            response.raise_for_status()
+            return [d["embedding"] for d in response.json()["data"]]
+            
+        raise Exception("Jina API rate limit exceeded after maximum retries.")
     
     # ═══════════════════════════════════════════════════════════════════
     # ASYNC METHODS (using httpx — used by retriever)
