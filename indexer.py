@@ -540,50 +540,54 @@ class Indexer:
             print(f"[OK] All {len(nodes)} text points already exist. Skipping embedding & upsert.")
             result["text_count"] = 0
         else:
-            # Step 3: Embed NEW text chunks in batches to limit peak memory
+            # Step 3: Embed NEW text chunks in batches to limit peak memory and ensure crash resilience
             new_text_contents = [node.get_content() for _, _, node in new_chunks]
             EMBED_BATCH = 50  # Process 50 chunks at a time
-            all_dense = []
-            for batch_start in range(0, len(new_text_contents), EMBED_BATCH):
-                batch = new_text_contents[batch_start:batch_start + EMBED_BATCH]
-                batch_num = batch_start // EMBED_BATCH + 1
-                total_batches = (len(new_text_contents) + EMBED_BATCH - 1) // EMBED_BATCH
-                print(f"[EMBED] Batch {batch_num}/{total_batches}: embedding {len(batch)} chunks via Jina v4...")
-                batch_vecs = self.embedder.embed_texts(batch, task="retrieval.passage")
-                all_dense.extend(batch_vecs)
-                del batch_vecs  # Free batch immediately
-            dense_vectors = all_dense
-            print(f"[OK] Generated {len(dense_vectors)} dense embeddings")
+            total_upserted = 0
             
             # Step 3b: Generate BM25 sparse vectors (local, instant)
             print(f"[SPARSE] Generating BM25 sparse vectors for {len(new_text_contents)} chunks...")
-            sparse_vectors = self.sparse_encoder.encode_documents(new_text_contents)
-            print(f"[OK] Generated {len(sparse_vectors)} sparse vectors")
+            all_sparse_vectors = self.sparse_encoder.encode_documents(new_text_contents)
+            print(f"[OK] Generated {len(all_sparse_vectors)} sparse vectors")
             
-            # Free raw text contents — no longer needed
-            del new_text_contents
+            for batch_start in range(0, len(new_text_contents), EMBED_BATCH):
+                batch = new_text_contents[batch_start:batch_start + EMBED_BATCH]
+                batch_chunks = new_chunks[batch_start:batch_start + EMBED_BATCH]
+                batch_sparse = all_sparse_vectors[batch_start:batch_start + EMBED_BATCH]
+                
+                batch_num = batch_start // EMBED_BATCH + 1
+                total_batches = (len(new_text_contents) + EMBED_BATCH - 1) // EMBED_BATCH
+                
+                try:
+                    print(f"[EMBED] Batch {batch_num}/{total_batches}: embedding {len(batch)} chunks via Jina v4...")
+                    batch_vecs = self.embedder.embed_texts(batch, task="retrieval.passage")
+                    
+                    # Package and upsert
+                    text_points: List[TextPoint] = []
+                    for (point_id, idx, node), dense_vec, sparse_vec in zip(batch_chunks, batch_vecs, batch_sparse):
+                        text_points.append(
+                            TextPoint(
+                                id=point_id,
+                                text_chunk=node.get_content(),
+                                dense_vector=dense_vec,
+                                sparse_indices=sparse_vec["indices"],
+                                sparse_values=sparse_vec["values"],
+                                payload={"source": file_path, **node.metadata}
+                            )
+                        )
+                    
+                    self.qdrant_manager.upsert_text_points(text_points)
+                    total_upserted += len(text_points)
+                    print(f"   [OK] Batch {batch_num} upserted successfully.")
+                    del batch_vecs, text_points
+                except Exception as e:
+                    print(f"   [ERROR] Batch {batch_num} failed: {e}. Skipping this batch.")
             
-            # Step 4: Package and upsert (dense + sparse)
-            text_points: List[TextPoint] = []
-            for (point_id, idx, node), dense_vec, sparse_vec in zip(new_chunks, dense_vectors, sparse_vectors):
-                text_points.append(
-                    TextPoint(
-                        id=point_id,
-                        text_chunk=node.get_content(),
-                        dense_vector=dense_vec,
-                        sparse_indices=sparse_vec["indices"],
-                        sparse_values=sparse_vec["values"],
-                        payload={"source": file_path, **node.metadata}
-                    )
-                )
+            # Free memory
+            del new_text_contents, all_sparse_vectors, new_chunks
             
-            # Free vectors before upsert (upsert copies data)
-            del dense_vectors, sparse_vectors, new_chunks
-            
-            self.qdrant_manager.upsert_text_points(text_points)
-            print(f"[OK] Upserted {len(text_points)} NEW text points (skipped {len(existing_text_ids)} existing).")
-            result["text_count"] = len(text_points)
-            del text_points  # Free immediately
+            print(f"[OK] Upserted {total_upserted} NEW text points (skipped {len(existing_text_ids)} existing).")
+            result["text_count"] = total_upserted
         
         # Free nodes and pages to reclaim memory before image processing
         del nodes
@@ -637,99 +641,6 @@ class Indexer:
         
         return images_data
     
-    def _index_images_from_urls(self, json_objs: List, source_file: str) -> int:
-        """
-        Embeds images directly from URLs using Jina API (no local download).
-        
-        Returns:
-            int: Number of images successfully indexed
-        """
-        images_data = self._extract_image_urls(json_objs)
-        
-        if not images_data:
-            print("[INFO] No images found in document.")
-            return 0
-        
-        print(f"[EMBED] Embedding {len(images_data)} images from URLs via Jina API...")
-        
-        # Extract URLs for embedding
-        image_urls = [img["url"] for img in images_data]
-        
-        try:
-            # Jina supports URL-based image embedding directly
-            image_vectors = self.embedder.embed_images(image_urls)
-        except Exception as e:
-            print(f"[ERROR] Failed to embed images from URLs: {e}")
-            return 0
-        
-        print(f"[OK] Generated {len(image_vectors)} image embeddings from URLs")
-        
-        # Create image points
-        image_points: List[ImagePoint] = []
-        NAMESPACE_UUID = uuid.UUID("00000000-0000-0000-0000-000000000000")
-        
-        for img_info, image_vector in zip(images_data, image_vectors):
-            # Deterministic ID based on URL
-            url_hash = hashlib.md5(img_info["url"].encode()).hexdigest()
-            point_id = str(uuid.uuid5(NAMESPACE_UUID, url_hash))
-            
-            image_points.append(
-                ImagePoint(
-                    id=point_id,
-                    image_path=img_info["url"],
-                    image_vector=image_vector,
-                    payload={
-                        "source": source_file,
-                        "original_name": img_info.get("name", "unknown"),
-                        "image_url": img_info["url"],
-                        "type": "image",
-                        "page": img_info.get("page", 0) + 1,
-                        "file_name": Path(source_file).name,
-                        "caption": "",
-                        "indexed_from": "url"
-                    }
-                )
-            )
-        
-        # Check which image points already exist and only upsert new ones
-        if image_points:
-            all_image_ids = [p.id for p in image_points]
-            existing_image_ids = self.qdrant_manager.get_existing_image_ids(all_image_ids)
-            
-            new_image_points = [p for p in image_points if p.id not in existing_image_ids]
-            
-            if new_image_points:
-                # Caption new images using Groq Vision + embed captions for text→image search
-                import time as time_mod
-                print(f"[CAPTION] Generating captions for {len(new_image_points)} images via Groq...")
-                captions_to_embed = []
-                for i, point in enumerate(new_image_points):
-                    img_url = point.payload.get("image_url", "")
-                    caption = self._caption_image(img_url)
-                    point.payload["caption"] = caption
-                    captions_to_embed.append(caption if caption else "image")
-                    if caption:
-                        print(f"   [{i+1}/{len(new_image_points)}] \"{caption[:60]}...\"")
-                    if i < len(new_image_points) - 1:
-                        time_mod.sleep(2)
-                
-                # Embed captions as text vectors for text→image retrieval
-                print(f"[EMBED] Embedding {len(captions_to_embed)} captions for text→image search...")
-                try:
-                    caption_vectors = self.embedder.embed_texts(captions_to_embed, task="retrieval.passage")
-                    for point, cap_vec in zip(new_image_points, caption_vectors):
-                        point.caption_vector = cap_vec
-                except Exception as e:
-                    print(f"   [WARN] Caption embedding failed: {e}")
-                
-                self.qdrant_manager.upsert_image_points(new_image_points)
-                print(f"[OK] Upserted {len(new_image_points)} NEW URL-indexed image points (skipped {len(existing_image_ids)} existing).")
-            else:
-                print(f"[OK] All {len(image_points)} image points already exist. Skipping upsert.")
-            
-            return len(new_image_points)
-        
-        return 0
         
     def _index_downloaded_images(self, images_data: List[Dict], source_file: str) -> int:
         """

@@ -4,7 +4,7 @@ Fuses dense (Jina) and sparse (BM25) search results using RRF.
 Operates on LlamaIndex NodeWithScore objects for direct pipeline integration.
 """
 
-from typing import List, Optional
+from typing import List, Optional, Dict
 from collections import defaultdict
 
 from llama_index.core.schema import NodeWithScore
@@ -51,9 +51,9 @@ def rrf_fuse(
     w_s = sparse_weight / total_w
     
     # Map: node_id → accumulated RRF score
-    rrf_scores: dict[str, float] = defaultdict(float)
+    rrf_scores: Dict[str, float] = defaultdict(float)
     # Map: node_id → NodeWithScore (first occurrence wins)
-    node_map: dict[str, NodeWithScore] = {}
+    node_map: Dict[str, NodeWithScore] = {}
     
     # Score dense results
     for rank, nws in enumerate(dense_nodes, start=1):

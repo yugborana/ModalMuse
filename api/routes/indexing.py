@@ -27,17 +27,9 @@ from api.shared_resources import (
     SharedResources,
     TASK_REGISTRY,
     INDEXING_EXECUTOR,
-    TaskState
+    TaskState,
+    sanitize_error
 )
-
-
-def sanitize_error(error: Exception) -> str:
-    """Sanitize error message to remove non-ASCII characters that cause encoding issues."""
-    try:
-        msg = str(error)
-        return msg.encode('ascii', 'replace').decode('ascii')
-    except:
-        return "An error occurred (message contained invalid characters)"
 
 router = APIRouter(prefix="/index", tags=["Indexing"])
 

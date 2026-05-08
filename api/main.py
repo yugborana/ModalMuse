@@ -20,16 +20,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import config
 from api.routes import indexing_router, query_router
 from api.routes.conversations import router as conversations_router
-from api.shared_resources import shutdown as shutdown_shared_resources
-
-
-def sanitize_error(error: Exception) -> str:
-    """Sanitize error message to remove non-ASCII characters that cause encoding issues."""
-    try:
-        msg = str(error)
-        return msg.encode('ascii', 'replace').decode('ascii')
-    except:
-        return "An error occurred (message contained invalid characters)"
+from api.shared_resources import shutdown as shutdown_shared_resources, sanitize_error
 
 
 @asynccontextmanager

@@ -345,7 +345,8 @@ class QdrantManager:
             print(f"   [CACHE] Stored response for: '{query_text[:40]}...'")
             
         except Exception as e:
-            print(f"   [WARN] Cache store failed: {e}")
+            if "not found" not in str(e).lower():
+                print(f"   [WARN] Cache store failed: {e}")
 
     def clear_response_cache(self) -> None:
         """Clear all cached responses (call after indexing new documents)."""
