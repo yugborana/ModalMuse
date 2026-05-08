@@ -37,7 +37,7 @@ export default function StreamProgress({
             {/* Pipeline Progress */}
             <div className="flex items-center gap-2 text-xs">
                 {Object.entries(PHASE_CONFIG).map(([phase, config], idx) => {
-                    const isCompleted = completedPhases.has(phase as keyof typeof PHASE_CONFIG);
+                    const isCompleted = completedPhases.has(phase as PhaseEvent['phase']);
                     const isCurrent = currentPhase === phase;
 
                     return (
