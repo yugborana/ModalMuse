@@ -50,6 +50,7 @@ class IndexingStatus(BaseModel):
     """Response model for indexing status."""
     status: str
     message: str
+    task_id: Optional[str] = None
     file_name: Optional[str] = None
     text_vectors: Optional[int] = None
     image_vectors: Optional[int] = None
@@ -197,7 +198,8 @@ async def upload_and_index(
     
     return IndexingStatus(
         status="started",
-        message=f"Indexing started for {file.filename}. Task ID: {task_id}",
+        task_id=task_id,
+        message=f"Indexing started for {file.filename}.",
         file_name=file.filename,
         progress=0
     )
@@ -292,9 +294,18 @@ async def get_collection_stats():
             )
             
         except Exception as e:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Failed to connect to Qdrant: {sanitize_error(e)}"
+            # Return graceful fallback instead of 500 (frontend polls this every 30s)
+            return CollectionStats(
+                text_collection={
+                    "name": config.TEXT_COLLECTION_NAME,
+                    "points_count": 0,
+                    "status": "unavailable",
+                },
+                image_collection={
+                    "name": config.IMAGE_COLLECTION_NAME,
+                    "points_count": 0,
+                    "status": "unavailable",
+                },
             )
 
 
@@ -313,10 +324,15 @@ async def delete_collection(collection_name: str):
             detail=f"Invalid collection name. Must be one of: {valid_names}"
         )
     
+    headers = {}
+    if config.QDRANT_API_KEY:
+        headers["api-key"] = config.QDRANT_API_KEY
+    
     async with httpx.AsyncClient() as client:
         try:
             response = await client.delete(
-                f"{config.QDRANT_URL}/collections/{collection_name}"
+                f"{config.QDRANT_URL}/collections/{collection_name}",
+                headers=headers
             )
             
             if response.status_code == 200:

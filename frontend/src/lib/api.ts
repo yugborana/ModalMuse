@@ -122,9 +122,7 @@ export async function uploadDocument(file: File): Promise<{ task_id: string }> {
     }
 
     const result = await response.json();
-    // Extract task_id from message
-    const match = result.message?.match(/Task ID: ([a-f0-9-]+)/);
-    return { task_id: match?.[1] || '' };
+    return { task_id: result.task_id || '' };
 }
 
 export async function getIndexingStatus(taskId: string): Promise<IndexingStatus> {

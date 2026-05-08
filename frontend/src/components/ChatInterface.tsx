@@ -6,6 +6,7 @@ import { useRAGWebSocket, SourceItem } from '@/lib/useWebSocket';
 import { createConversation, addMessage as saveMessage, Message as ConvMessage } from '@/lib/conversations';
 import SourcesPanel from '@/components/SourcesPanel';
 import StreamProgress from '@/components/StreamProgress';
+import ReactMarkdown from 'react-markdown';
 
 interface Message {
     id: string;
@@ -305,10 +306,14 @@ export default function ChatInterface({
                                             </div>
                                         ) : (
                                             <>
-                                                <p className="whitespace-pre-wrap leading-relaxed text-[15px]">
-                                                    {message.content}
+                                                <div className="leading-relaxed text-[15px] prose prose-invert prose-sm max-w-none">
+                                                    {message.role === 'assistant' ? (
+                                                        <ReactMarkdown>{message.content}</ReactMarkdown>
+                                                    ) : (
+                                                        <p className="whitespace-pre-wrap">{message.content}</p>
+                                                    )}
                                                     {message.isStreaming && <span className="inline-block w-2 h-4 ml-1 bg-[var(--accent-gold)] animate-pulse" />}
-                                                </p>
+                                                </div>
                                                 {message.sources && message.sources.length > 0 && !message.isStreaming && (
                                                     <button
                                                         onClick={() => {

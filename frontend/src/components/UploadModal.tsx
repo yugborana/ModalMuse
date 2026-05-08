@@ -41,6 +41,12 @@ export default function UploadModal({ onClose }: UploadModalProps) {
             return;
         }
 
+        const MAX_SIZE_MB = 50;
+        if (file.size > MAX_SIZE_MB * 1024 * 1024) {
+            alert(`File too large. Maximum size is ${MAX_SIZE_MB}MB.`);
+            return;
+        }
+
         setUploadStatus({
             status: 'started',
             message: 'Uploading document...',
@@ -76,12 +82,12 @@ export default function UploadModal({ onClose }: UploadModalProps) {
 
         const file = e.dataTransfer.files[0];
         if (file) handleUpload(file);
-    }, []);
+    }, [isPolling]);
 
-    const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const handleFileSelect = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
         const file = e.target.files?.[0];
         if (file) handleUpload(file);
-    };
+    }, [isPolling]);
 
     return (
         <>
