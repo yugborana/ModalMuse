@@ -305,72 +305,7 @@ class Indexer:
         
         return images_data
 
-    def _caption_image(self, image_source: str) -> str:
-        """Generate a caption for an image using Groq Vision model.
-        
-        Args:
-            image_source: URL or local file path to the image
-            
-        Returns:
-            Caption string, or empty string if captioning fails
-        """
-        if not self._groq_client:
-            return ""
-        
-        import io
-        from PIL import Image
-        
-        try:
-            # Load image
-            if image_source.startswith('http://') or image_source.startswith('https://'):
-                with httpx.Client(timeout=30.0) as client:
-                    resp = client.get(image_source)
-                    resp.raise_for_status()
-                    img_data = io.BytesIO(resp.content)
-            else:
-                img_data = open(image_source, 'rb')
-            
-            img = Image.open(img_data)
-            
-            # Resize if too large (Groq limit: 33M pixels)
-            width, height = img.size
-            if width * height > 30_000_000:
-                scale = (30_000_000 / (width * height)) ** 0.5
-                img = img.resize((int(width * scale), int(height * scale)), Image.Resampling.LANCZOS)
-            
-            if img.mode in ('RGBA', 'P'):
-                img = img.convert('RGB')
-            
-            buffer = io.BytesIO()
-            img.save(buffer, format='JPEG', quality=85)
-            buffer.seek(0)
-            base64_image = base64.b64encode(buffer.read()).decode('utf-8')
-            
-            # Free PIL image immediately
-            img.close()
-            del img
-            
-            completion = self._groq_client.chat.completions.create(
-                model=config.GROQ_MODEL_NAME,
-                messages=[{
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": "Describe this image in 2-3 sentences. Focus on what it depicts, any text/labels visible, and its purpose in a technical/academic context."},
-                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}
-                    ]
-                }],
-                max_tokens=150,
-                temperature=0.3
-            )
-            
-            # Free base64 string immediately
-            del base64_image
-            
-            return completion.choices[0].message.content.strip()
-            
-        except Exception as e:
-            print(f"   [WARN] Image captioning failed: {e}")
-            return ""
+
 
     # --- Core Indexing Function ---
 
