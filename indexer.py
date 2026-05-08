@@ -132,56 +132,63 @@ class Indexer:
     def _caption_image(self, image_source: str) -> str:
         """Generate a text caption/summary for an image using Groq Vision.
         
+        For URL images (Supabase etc.), passes the URL directly to Groq — 
+        zero bytes downloaded into server memory.
+        For local files only, reads and converts to base64.
+        
         Args:
             image_source: Local file path or HTTP URL to the image.
             
         Returns:
             Caption string, or empty string if captioning fails.
         """
-        import io
-        import httpx
         from groq import Groq
-        import gc
         
         try:
             is_url = image_source.startswith("http://") or image_source.startswith("https://")
             
             if is_url:
-                # Download image from URL
-                with httpx.Client(timeout=30.0) as client:
-                    response = client.get(image_source)
-                    response.raise_for_status()
-                    image_data = response.content
+                # ── URL path: pass directly to Groq Vision (NO download, NO memory) ──
+                image_content = {
+                    "type": "image_url",
+                    "image_url": {"url": image_source}
+                }
             else:
-                # Read local file
+                # ── Local file path: read, resize, convert to base64 ──
+                import io
+                import gc
+                from PIL import Image
+                
                 with open(image_source, "rb") as f:
                     image_data = f.read()
-            
-            # Resize if needed (Groq 33M pixel limit)
-            from PIL import Image
-            
-            b64_image = ""
-            with Image.open(io.BytesIO(image_data)) as img:
-                width, height = img.size
-                total_pixels = width * height
-                max_pixels = 4_000_000  # Reduced to 4M pixels (~2000x2000) to save massive RAM overhead
                 
-                if total_pixels > max_pixels:
-                    scale = (max_pixels / total_pixels) ** 0.5
-                    new_w, new_h = int(width * scale), int(height * scale)
-                    img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+                b64_image = ""
+                with Image.open(io.BytesIO(image_data)) as img:
+                    width, height = img.size
+                    max_pixels = 4_000_000
+                    
+                    if width * height > max_pixels:
+                        scale = (max_pixels / (width * height)) ** 0.5
+                        img = img.resize(
+                            (int(width * scale), int(height * scale)),
+                            Image.Resampling.LANCZOS
+                        )
+                    
+                    if img.mode in ('RGBA', 'P'):
+                        img = img.convert('RGB')
+                    
+                    with io.BytesIO() as buffer:
+                        img.save(buffer, format='JPEG', quality=85)
+                        buffer.seek(0)
+                        b64_image = base64.b64encode(buffer.read()).decode('utf-8')
                 
-                if img.mode in ('RGBA', 'P'):
-                    img = img.convert('RGB')
+                del image_data
+                gc.collect()
                 
-                with io.BytesIO() as buffer:
-                    img.save(buffer, format='JPEG', quality=85)
-                    buffer.seek(0)
-                    b64_image = base64.b64encode(buffer.read()).decode('utf-8')
-            
-            # Force memory cleanup of massive image data immediately
-            del image_data
-            gc.collect()
+                image_content = {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/jpeg;base64,{b64_image}"}
+                }
             
             # Call Groq Vision for captioning
             groq_client = Groq(api_key=config.GROQ_API_KEY)
@@ -196,12 +203,7 @@ class Indexer:
                                 "type": "text",
                                 "text": "Describe this image in 1-2 sentences. Focus on what the image shows — diagrams, charts, text, formulas, or visual content. Be specific and factual."
                             },
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:image/jpeg;base64,{b64_image}"
-                                }
-                            }
+                            image_content
                         ]
                     }
                 ],
@@ -211,9 +213,10 @@ class Indexer:
             
             caption = response.choices[0].message.content.strip()
             
-            # Free base64 string
-            del b64_image
-            gc.collect()
+            # Free base64 string if it was a local file
+            if not is_url:
+                del b64_image
+                import gc; gc.collect()
             
             return caption
             

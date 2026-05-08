@@ -86,10 +86,21 @@ class JinaEmbeddings:
             "late_chunking": late_chunking,
         }
         
-        response = requests.post(self.API_URL, headers=self.headers, json=data)
-        response.raise_for_status()
+        import time
+        max_retries = 3
+        for attempt in range(max_retries):
+            response = requests.post(self.API_URL, headers=self.headers, json=data)
+            
+            if response.status_code == 429:
+                wait_time = 30 * (attempt + 1)
+                print(f"[WARN] Jina text embed rate limit (429). Retrying in {wait_time}s... (Attempt {attempt+1}/{max_retries})")
+                time.sleep(wait_time)
+                continue
+            
+            response.raise_for_status()
+            return [d["embedding"] for d in response.json()["data"]]
         
-        return [d["embedding"] for d in response.json()["data"]]
+        raise Exception("Jina API rate limit exceeded after maximum retries.")
     
     def embed_images(
         self, 
