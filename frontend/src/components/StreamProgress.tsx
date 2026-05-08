@@ -12,8 +12,10 @@ interface StreamProgressProps {
     isStreaming: boolean;
 }
 
-const PHASE_CONFIG = {
+const PHASE_CONFIG: Record<string, { icon: string; label: string; color: string }> = {
     embedding: { icon: '🔮', label: 'Embedding', color: '#a78bfa' },
+    search: { icon: '🔍', label: 'Searching', color: '#38bdf8' },
+    fusion: { icon: '🔄', label: 'Fusing', color: '#34d399' },
     reranking: { icon: '⚖️', label: 'Reranking', color: '#f59e0b' },
     generation: { icon: '✨', label: 'Generating', color: '#b08d57' },
 };
