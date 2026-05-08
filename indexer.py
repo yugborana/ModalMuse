@@ -141,6 +141,7 @@ class Indexer:
         import io
         import httpx
         from groq import Groq
+        import gc
         
         try:
             is_url = image_source.startswith("http://") or image_source.startswith("https://")
@@ -158,23 +159,29 @@ class Indexer:
             
             # Resize if needed (Groq 33M pixel limit)
             from PIL import Image
-            img = Image.open(io.BytesIO(image_data))
-            width, height = img.size
-            total_pixels = width * height
-            max_pixels = 30_000_000
             
-            if total_pixels > max_pixels:
-                scale = (max_pixels / total_pixels) ** 0.5
-                new_w, new_h = int(width * scale), int(height * scale)
-                img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+            b64_image = ""
+            with Image.open(io.BytesIO(image_data)) as img:
+                width, height = img.size
+                total_pixels = width * height
+                max_pixels = 4_000_000  # Reduced to 4M pixels (~2000x2000) to save massive RAM overhead
+                
+                if total_pixels > max_pixels:
+                    scale = (max_pixels / total_pixels) ** 0.5
+                    new_w, new_h = int(width * scale), int(height * scale)
+                    img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+                
+                if img.mode in ('RGBA', 'P'):
+                    img = img.convert('RGB')
+                
+                with io.BytesIO() as buffer:
+                    img.save(buffer, format='JPEG', quality=85)
+                    buffer.seek(0)
+                    b64_image = base64.b64encode(buffer.read()).decode('utf-8')
             
-            if img.mode in ('RGBA', 'P'):
-                img = img.convert('RGB')
-            
-            buffer = io.BytesIO()
-            img.save(buffer, format='JPEG', quality=85)
-            buffer.seek(0)
-            b64_image = base64.b64encode(buffer.read()).decode('utf-8')
+            # Force memory cleanup of massive image data immediately
+            del image_data
+            gc.collect()
             
             # Call Groq Vision for captioning
             groq_client = Groq(api_key=config.GROQ_API_KEY)
@@ -203,6 +210,11 @@ class Indexer:
             )
             
             caption = response.choices[0].message.content.strip()
+            
+            # Free base64 string
+            del b64_image
+            gc.collect()
+            
             return caption
             
         except Exception as e:
