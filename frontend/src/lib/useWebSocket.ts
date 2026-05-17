@@ -1,4 +1,4 @@
-// WebSocket hook for real-time RAG streaming
+// WebSocket hook for real-time RAG streaming with auto-reconnection
 // lib/useWebSocket.ts
 
 import { useState, useCallback, useRef, useEffect } from 'react';
@@ -84,62 +84,38 @@ export interface StreamState {
 }
 
 // ═══════════════════════════════════════════════════════════════════
+// RECONNECTION CONFIG
+// ═══════════════════════════════════════════════════════════════════
+const MAX_RECONNECT_ATTEMPTS = 5;
+const BASE_RECONNECT_DELAY_MS = 1000; // 1s, 2s, 4s, 8s, 16s
+
+// ═══════════════════════════════════════════════════════════════════
 // HOOK
 // ═══════════════════════════════════════════════════════════════════
+
+const INITIAL_STATE: StreamState = {
+    isStreaming: false,
+    currentPhase: null,
+    phases: [],
+    chunksFound: null,
+    response: '',
+    sources: [],
+    error: null,
+    totalDuration: null,
+};
 
 export function useRAGWebSocket() {
     const wsRef = useRef<WebSocket | null>(null);
     const [isConnected, setIsConnected] = useState(false);
+    const reconnectAttemptsRef = useRef(0);
+    const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+    const pendingQueryRef = useRef<{ query: string; options?: { includeSources?: boolean; conversationId?: string } } | null>(null);
 
-    const [streamState, setStreamState] = useState<StreamState>({
-        isStreaming: false,
-        currentPhase: null,
-        phases: [],
-        chunksFound: null,
-        response: '',
-        sources: [],
-        error: null,
-        totalDuration: null,
-    });
+    const [streamState, setStreamState] = useState<StreamState>({ ...INITIAL_STATE });
 
-    // Connect to WebSocket
-    const connect = useCallback(() => {
-        if (wsRef.current?.readyState === WebSocket.OPEN) return;
-
-        const ws = new WebSocket(`${WS_BASE}/ws/query`);
-
-        ws.onopen = () => {
-            console.log('[WS] Connected');
-            setIsConnected(true);
-        };
-
-        ws.onclose = () => {
-            console.log('[WS] Disconnected');
-            setIsConnected(false);
-            wsRef.current = null;
-        };
-
-        ws.onerror = (error) => {
-            console.error('[WS] Error:', error);
-            setStreamState(prev => ({ ...prev, error: 'WebSocket connection error' }));
-        };
-
-        ws.onmessage = (event) => {
-            try {
-                const data: StreamEvent = JSON.parse(event.data);
-                handleEvent(data);
-            } catch (e) {
-                console.error('[WS] Parse error:', e);
-            }
-        };
-
-        wsRef.current = ws;
-    }, []);
-
-    // Handle incoming events
-    const handleEvent = useCallback((event: StreamEvent) => {
-        console.log('[WS] Received event:', event.type, event);
-
+    // ── Event handler (stable, no deps) ──
+    const handleEventRef = useRef<(event: StreamEvent) => void>(() => {});
+    handleEventRef.current = (event: StreamEvent) => {
         switch (event.type) {
             case 'phase':
                 setStreamState(prev => ({
@@ -174,7 +150,6 @@ export function useRAGWebSocket() {
                 break;
 
             case 'done':
-                console.log('[WS] Stream complete, setting isStreaming to false');
                 setStreamState(prev => ({
                     ...prev,
                     isStreaming: false,
@@ -192,96 +167,108 @@ export function useRAGWebSocket() {
                 }));
                 break;
         }
-    }, []);
+    };
 
-    // Send query
-    const sendQuery = useCallback((query: string, options?: {
-        includeSources?: boolean;
-        detailed?: boolean;
-        conversationId?: string;
-    }) => {
-        // Reset state
-        setStreamState({
-            isStreaming: true,
-            currentPhase: null,
-            phases: [],
-            chunksFound: null,
-            response: '',
-            sources: [],
-            error: null,
-            totalDuration: null,
-        });
+    // ── Connection factory (ref-based to avoid circular useCallback) ──
+    const createConnectionRef = useRef<() => WebSocket>(() => null as unknown as WebSocket);
+    createConnectionRef.current = (): WebSocket => {
+        const ws = new WebSocket(`${WS_BASE}/ws/query`);
 
-        // Connect if needed
-        if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
-            console.log('[WS] Creating new WebSocket connection');
-            const ws = new WebSocket(`${WS_BASE}/ws/query`);
+        ws.onopen = () => {
+            console.log('[WS] Connected');
+            setIsConnected(true);
+            reconnectAttemptsRef.current = 0;
 
-            ws.onopen = () => {
-                console.log('[WS] Connected, sending query:', query.slice(0, 50));
-                setIsConnected(true);
+            if (pendingQueryRef.current) {
+                const { query, options } = pendingQueryRef.current;
+                pendingQueryRef.current = null;
                 ws.send(JSON.stringify({
                     query,
                     include_sources: options?.includeSources ?? true,
-                    detailed: options?.detailed ?? true,
+                    detailed: true,
                     conversation_id: options?.conversationId,
                 }));
-            };
+            }
+        };
 
-            ws.onmessage = (event) => {
-                try {
-                    const data: StreamEvent = JSON.parse(event.data);
-                    handleEvent(data);
-                } catch (e) {
-                    console.error('[WS] Parse error:', e);
-                }
-            };
+        ws.onmessage = (msgEvent) => {
+            try {
+                const data: StreamEvent = JSON.parse(msgEvent.data);
+                handleEventRef.current(data);
+            } catch (e) {
+                console.error('[WS] Parse error:', e);
+            }
+        };
 
-            ws.onclose = (event) => {
-                console.log('[WS] Connection closed:', event.code, event.reason);
-                setIsConnected(false);
-                wsRef.current = null;
-            };
+        ws.onclose = (closeEvent) => {
+            console.log('[WS] Connection closed:', closeEvent.code, closeEvent.reason);
+            setIsConnected(false);
+            wsRef.current = null;
 
-            ws.onerror = () => {
+            // Auto-reconnect only on unexpected close (not code 1000)
+            if (closeEvent.code !== 1000 && reconnectAttemptsRef.current < MAX_RECONNECT_ATTEMPTS) {
+                const delay = BASE_RECONNECT_DELAY_MS * Math.pow(2, reconnectAttemptsRef.current);
+                console.log(`[WS] Reconnecting in ${delay}ms (attempt ${reconnectAttemptsRef.current + 1}/${MAX_RECONNECT_ATTEMPTS})`);
+                reconnectTimerRef.current = setTimeout(() => {
+                    reconnectAttemptsRef.current += 1;
+                    wsRef.current = createConnectionRef.current();
+                }, delay);
+            } else if (reconnectAttemptsRef.current >= MAX_RECONNECT_ATTEMPTS) {
                 setStreamState(prev => ({
                     ...prev,
                     isStreaming: false,
-                    error: 'Connection failed'
+                    error: 'Connection lost. Please refresh the page.',
                 }));
-            };
+            }
+        };
 
-            wsRef.current = ws;
+        ws.onerror = () => {
+            console.error('[WS] Connection error');
+        };
+
+        return ws;
+    };
+
+    // ── Public API (all stable references) ──
+
+    const sendQuery = useCallback((query: string, options?: {
+        includeSources?: boolean;
+        conversationId?: string;
+    }) => {
+        setStreamState({
+            ...INITIAL_STATE,
+            isStreaming: true,
+        });
+
+        const message = JSON.stringify({
+            query,
+            include_sources: options?.includeSources ?? true,
+            detailed: true,
+            conversation_id: options?.conversationId,
+        });
+
+        if (wsRef.current?.readyState === WebSocket.OPEN) {
+            wsRef.current.send(message);
         } else {
-            wsRef.current.send(JSON.stringify({
-                query,
-                include_sources: options?.includeSources ?? true,
-                detailed: options?.detailed ?? true,
-                conversation_id: options?.conversationId,
-            }));
+            pendingQueryRef.current = { query, options };
+            wsRef.current = createConnectionRef.current();
         }
-    }, [handleEvent]);
+    }, []);
 
-    // Disconnect
     const disconnect = useCallback(() => {
+        if (reconnectTimerRef.current) {
+            clearTimeout(reconnectTimerRef.current);
+            reconnectTimerRef.current = null;
+        }
+        reconnectAttemptsRef.current = MAX_RECONNECT_ATTEMPTS;
         if (wsRef.current) {
-            wsRef.current.close();
+            wsRef.current.close(1000, 'Client disconnect');
             wsRef.current = null;
         }
     }, []);
 
-    // Reset state (for new conversations)
     const resetState = useCallback(() => {
-        setStreamState({
-            isStreaming: false,
-            currentPhase: null,
-            phases: [],
-            chunksFound: null,
-            response: '',
-            sources: [],
-            error: null,
-            totalDuration: null,
-        });
+        setStreamState({ ...INITIAL_STATE });
     }, []);
 
     // Cleanup on unmount
@@ -295,7 +282,6 @@ export function useRAGWebSocket() {
         isConnected,
         streamState,
         sendQuery,
-        connect,
         disconnect,
         resetState,
     };

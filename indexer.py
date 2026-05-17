@@ -12,7 +12,7 @@ from pathlib import Path
 
 # External Libraries
 from qdrant_manager import QdrantManager, TextPoint, ImagePoint
-from jina_client import JinaEmbeddings
+from local_client import LocalEmbeddings
 from bm25 import BM25SparseEncoder
 
 # LlamaIndex Components
@@ -29,10 +29,20 @@ class Indexer:
     def __init__(self, qdrant_manager: QdrantManager, llama_parse_api_key: str):
         self.qdrant_manager = qdrant_manager
         
-        # 1. Initialize Jina Embeddings (for both text and images)
-        print("[LOADING] Initializing Jina Embeddings...")
-        self.embedder = JinaEmbeddings(dimensions=config.JINA_EMBED_DIMENSIONS)
-        print("[OK] Jina Embeddings initialized")
+        # 1. Initialize Local Embeddings (separate text + image models via Infinity)
+        print("[LOADING] Initializing Local Embeddings (Infinity)...")
+        self.text_embedder = LocalEmbeddings(
+            model=config.LOCAL_TEXT_MODEL,
+            dimensions=config.LOCAL_TEXT_DIMENSIONS
+        )
+        self.image_embedder = LocalEmbeddings(
+            model=config.LOCAL_IMAGE_MODEL,
+            dimensions=config.LOCAL_IMAGE_DIMENSIONS
+        )
+        # Keep self.embedder as alias for text embedder (backward compat with embed_texts calls)
+        self.embedder = self.text_embedder
+        print(f"[OK] Text Embedder: {config.LOCAL_TEXT_MODEL} ({config.LOCAL_TEXT_DIMENSIONS}-dim)")
+        print(f"[OK] Image Embedder: {config.LOCAL_IMAGE_MODEL} ({config.LOCAL_IMAGE_DIMENSIONS}-dim)")
         
         # 2. Initialize BM25 Sparse Encoder (local, no API)
         self.sparse_encoder = BM25SparseEncoder()
@@ -51,19 +61,24 @@ class Indexer:
         # Initialize LlamaParse (API required for parsing)
         self.parser = LlamaParse(api_key=llama_parse_api_key, result_type="markdown", verbose=True)
         
-        # LlamaIndex Text Splitter
-        self.text_splitter = SentenceSplitter(chunk_size=1024, chunk_overlap=200)
+        # LlamaIndex Text Splitter (smaller chunks = more precise retrieval with bge-small-384d)
+        self.text_splitter = SentenceSplitter(
+            chunk_size=config.CHUNK_SIZE,
+            chunk_overlap=config.CHUNK_OVERLAP
+        )
         
         # --- Pre-calculate Dims for Qdrant Setup ---
-        self.dense_dim = self.embedder.embed_dim  # From Jina config (1024)
-        self.image_dim = self.embedder.embed_dim  # Same model for images!
+        self.dense_dim = self.text_embedder.embed_dim   # 384 (bge-small for text chunks)
+        self.image_dim = self.image_embedder.embed_dim  # 768 (jina-clip for image visuals)
+        self.caption_dim = self.text_embedder.embed_dim  # 384 (bge-small for caption text)
         
         # Initialize Qdrant Collections
         self.qdrant_manager.create_text_collection(
             dense_dim=self.dense_dim
         )
         self.qdrant_manager.create_image_collection(
-            image_dim=self.image_dim
+            image_dim=self.image_dim,
+            caption_dim=self.caption_dim
         )
         
         # --- Supabase Parse Cache ---
@@ -132,9 +147,9 @@ class Indexer:
     def _caption_image(self, image_source: str) -> str:
         """Generate a text caption/summary for an image using Groq Vision.
         
-        For URL images (Supabase etc.), passes the URL directly to Groq — 
-        zero bytes downloaded into server memory.
-        For local files only, reads and converts to base64.
+        Downloads the image if it's a URL (or reads if local), resizes it if 
+        it exceeds max pixel limits to avoid API errors (e.g., Groq's 33M pixel limit),
+        and sends it as base64.
         
         Args:
             image_source: Local file path or HTTP URL to the image.
@@ -143,80 +158,107 @@ class Indexer:
             Caption string, or empty string if captioning fails.
         """
         from groq import Groq
+        import io
+        import gc
+        import httpx
+        from PIL import Image
+        import base64
         
         try:
             is_url = image_source.startswith("http://") or image_source.startswith("https://")
             
             if is_url:
-                # ── URL path: pass directly to Groq Vision (NO download, NO memory) ──
-                image_content = {
-                    "type": "image_url",
-                    "image_url": {"url": image_source}
-                }
+                # ── URL path: fetch image to resize and avoid API size limits ──
+                with httpx.Client(timeout=15.0) as client:
+                    response = client.get(image_source)
+                    response.raise_for_status()
+                    image_data = response.content
             else:
-                # ── Local file path: read, resize, convert to base64 ──
-                import io
-                import gc
-                from PIL import Image
-                
+                # ── Local file path: read ──
                 with open(image_source, "rb") as f:
                     image_data = f.read()
-                
-                b64_image = ""
-                with Image.open(io.BytesIO(image_data)) as img:
-                    width, height = img.size
-                    max_pixels = 4_000_000
-                    
-                    if width * height > max_pixels:
-                        scale = (max_pixels / (width * height)) ** 0.5
-                        img = img.resize(
-                            (int(width * scale), int(height * scale)),
-                            Image.Resampling.LANCZOS
-                        )
-                    
-                    if img.mode in ('RGBA', 'P'):
-                        img = img.convert('RGB')
-                    
-                    with io.BytesIO() as buffer:
-                        img.save(buffer, format='JPEG', quality=85)
-                        buffer.seek(0)
-                        b64_image = base64.b64encode(buffer.read()).decode('utf-8')
-                
-                del image_data
-                gc.collect()
-                
-                image_content = {
-                    "type": "image_url",
-                    "image_url": {"url": f"data:image/jpeg;base64,{b64_image}"}
-                }
             
-            # Call Groq Vision for captioning
-            groq_client = Groq(api_key=config.GROQ_API_KEY)
+            b64_image = ""
+            with Image.open(io.BytesIO(image_data)) as img:
+                width, height = img.size
+                max_pixels = 4_000_000
+                
+                if width * height > max_pixels:
+                    scale = (max_pixels / (width * height)) ** 0.5
+                    img = img.resize(
+                        (int(width * scale), int(height * scale)),
+                        Image.Resampling.LANCZOS
+                    )
+                
+                if img.mode in ('RGBA', 'P'):
+                    img = img.convert('RGB')
+                
+                with io.BytesIO() as buffer:
+                    img.save(buffer, format='JPEG', quality=85)
+                    buffer.seek(0)
+                    b64_image = base64.b64encode(buffer.read()).decode('utf-8')
             
-            response = groq_client.chat.completions.create(
+            del image_data
+            gc.collect()
+            
+            image_content = {
+                "type": "image_url",
+                "image_url": {"url": f"data:image/jpeg;base64,{b64_image}"}
+            }
+            
+            # Use the shared Groq client (initialized in __init__)
+            if not self._groq_client:
+                from groq import Groq
+                self._groq_client = Groq(api_key=config.GROQ_API_KEY)
+            
+            response = self._groq_client.chat.completions.create(
                 model="meta-llama/llama-4-scout-17b-16e-instruct",
                 messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a technical image captioning system for search retrieval. "
+                            "Output ONLY the caption text. No preamble, no 'Here is...', no markdown headers. "
+                            "Start directly with the description."
+                        )
+                    },
                     {
                         "role": "user",
                         "content": [
                             {
                                 "type": "text",
-                                "text": "Describe this image in 1-2 sentences. Focus on what the image shows — diagrams, charts, text, formulas, or visual content. Be specific and factual."
+                                "text": (
+                                    "Caption this image for a search engine. Write a dense paragraph that includes:\n"
+                                    "- What the diagram/figure shows using precise technical terms (e.g. 'rotary positional embedding (RoPE)' not 'positional encoding')\n"
+                                    "- ALL visible text, labels, axis names, variable names, and formulas\n"
+                                    "- End with 'Keywords:' followed by 5-10 specific technical terms\n"
+                                    "Start directly with the description. No introductory phrases."
+                                )
                             },
                             image_content
                         ]
                     }
                 ],
-                max_tokens=150,
-                temperature=0.3
+                max_tokens=350,
+                temperature=0.2
             )
             
             caption = response.choices[0].message.content.strip()
             
-            # Free base64 string if it was a local file
-            if not is_url:
-                del b64_image
-                import gc; gc.collect()
+            # Post-process: strip common LLM preamble patterns
+            preamble_patterns = [
+                "Here is a caption for the image:",
+                "Here is the caption:",
+                "Here is a caption:",
+                "Caption:",
+            ]
+            for pattern in preamble_patterns:
+                if caption.lower().startswith(pattern.lower()):
+                    caption = caption[len(pattern):].strip()
+            
+            # Free base64 string
+            del b64_image
+            import gc; gc.collect()
             
             return caption
             
@@ -350,52 +392,12 @@ class Indexer:
             print(f"[CACHE] Found cached parse result in Supabase!")
             
             # Check if images need to be populated
-            needs_image_upload = False
-            
             if len(images_data) == 0:
-                print(f"[INFO] Cache has no images, will populate...")
-                needs_image_upload = True
-            else:
-                # Check if images are stored in Supabase (not LlamaParse temp URLs or local paths)
-                first_img = images_data[0] if images_data else {}
-                img_path = first_img.get("path", "") or first_img.get("url", "")
-                storage_type = first_img.get("storage", "")
-                
-                # Check if it's a Supabase URL or has storage="supabase" marker
-                is_supabase_url = (
-                    "supabase" in img_path.lower() or 
-                    storage_type == "supabase" or
-                    ".supabase.co" in img_path
-                )
-                is_llamaparse_url = "api.cloud.llamaindex.ai" in img_path
-                is_local_path = not img_path.startswith("http")
-                
-                if is_supabase_url:
-                    print(f"[OK] Images already in Supabase storage ({len(images_data)} images)")
-                elif is_llamaparse_url:
-                    print(f"[INFO] Cached images are LlamaParse temp URLs, re-uploading to Supabase...")
-                    needs_image_upload = True
-                elif is_local_path:
-                    print(f"[INFO] Cached images are local paths, re-uploading to Supabase...")
-                    needs_image_upload = True
-                else:
-                    print(f"[INFO] Unknown image storage, re-uploading to Supabase...")
-            
-            # Re-upload images if needed (uses job_id from cached json_objs)
-            if needs_image_upload:
-                # Get job_id from cached parse result
-                job_id = json_objs[0].get("job_id") if json_objs else None
-                print(f"[INFO] Using cached job_id: {job_id}")
-                
+                print(f"[INFO] Cache has no images, extracting URLs...")
                 if config.URL_BASED_IMAGE_INDEXING:
-                    print(f"[URL] Extracting image URLs from LlamaParse...")
                     images_data = self._extract_image_urls(json_objs)
                 else:
-                    print(f"[UPLOAD] Downloading images from LlamaParse (job_id: {job_id}) → Supabase...")
                     images_data = self._download_images_from_json(json_objs, None)
-                    print(f"[OK] Uploaded {len(images_data)} images to Supabase.")
-                
-                # Update cache with new image URLs
                 if len(images_data) > 0:
                     self._save_to_cache(file_hash, json_objs, images_data, file_name=Path(file_path).name)
                     print(f"[CACHE] Updated cache with {len(images_data)} image URLs")
@@ -509,7 +511,7 @@ class Indexer:
                 total_batches = (len(new_text_contents) + EMBED_BATCH - 1) // EMBED_BATCH
                 
                 try:
-                    print(f"[EMBED] Batch {batch_num}/{total_batches}: embedding {len(batch)} chunks via Jina v4...")
+                    print(f"[EMBED] Batch {batch_num}/{total_batches}: embedding {len(batch)} chunks...")
                     batch_vecs = self.embedder.embed_texts(batch, task="retrieval.passage")
                     
                     # Package and upsert
@@ -594,7 +596,7 @@ class Indexer:
         
     def _index_downloaded_images(self, images_data: List[Dict], source_file: str) -> int:
         """
-        Embeds images using Jina API.
+        Embeds images using local Infinity API.
         Supports both Supabase storage URLs and local file paths.
         
         Returns:
@@ -661,8 +663,8 @@ class Indexer:
         # Process images in batches: embed → caption → upsert per batch
         # This ensures partial progress is saved — if we crash at batch 3,
         # batches 1-2 are already in Qdrant and will be skipped on re-run.
-        BATCH_SIZE = config.JINA_IMAGE_BATCH_SIZE
-        BATCH_DELAY = config.JINA_BATCH_DELAY_SECONDS
+        BATCH_SIZE = config.LOCAL_IMAGE_BATCH_SIZE
+        BATCH_DELAY = config.LOCAL_BATCH_DELAY_SECONDS
         total_upserted = 0
         total_batches = (len(new_images) + BATCH_SIZE - 1) // BATCH_SIZE
         
@@ -679,13 +681,13 @@ class Indexer:
             
             # Rate-limit delay between batches
             if batch_idx > 0 and BATCH_DELAY > 0:
-                print(f"   [WAIT] Sleeping {BATCH_DELAY}s to respect Jina rate limit...")
+                print(f"   [WAIT] Sleeping {BATCH_DELAY}s between batches...")
                 time_mod.sleep(BATCH_DELAY)
             
             # ── 1. Embed this batch ──
             print(f"   [BATCH {batch_num}/{total_batches}] Embedding {len(batch_sources)} images...")
             try:
-                batch_vectors = self.embedder.embed_images(batch_sources)
+                batch_vectors = self.image_embedder.embed_images(batch_sources)
             except Exception as e:
                 print(f"   [ERROR] Batch {batch_num} embedding failed: {e}")
                 print(f"   [SAVE] {total_upserted} images already saved to Qdrant from previous batches.")
@@ -710,11 +712,11 @@ class Indexer:
                 if caption:
                     print(f"   [CAPTION] \"{caption[:60]}...\"")
                 
-                # Embed the caption as text vector for text→image search
+                # Embed the caption as text vector for text→image search (uses text model)
                 caption_vec = []
                 if caption:
                     try:
-                        caption_vecs = self.embedder.embed_texts([caption], task="retrieval.passage")
+                        caption_vecs = self.text_embedder.embed_texts([caption], task="retrieval.passage")
                         caption_vec = caption_vecs[0] if caption_vecs else []
                     except Exception as e:
                         print(f"   [WARN] Caption embedding failed: {e}")

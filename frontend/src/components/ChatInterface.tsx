@@ -47,8 +47,6 @@ export default function ChatInterface({
 
     // Load initial messages when conversation changes
     useEffect(() => {
-        // Skip reset if we're actively streaming - this happens when we just created a new conversation
-        // as part of submitting a query, and we don't want to interrupt the ongoing stream
         const isActivelyStreaming = currentMessageIdRef.current !== null;
 
         console.log('[Chat] Conversation effect running:', {
@@ -58,32 +56,31 @@ export default function ChatInterface({
             initialMessagesCount: initialMessages?.length ?? 0
         });
 
-        if (!isActivelyStreaming) {
-            // Only reset when switching to a DIFFERENT conversation (user clicked on sidebar)
-            console.log('[Chat] Resetting state (not streaming)');
-            resetState();
-            currentMessageIdRef.current = null;
+        // Only process if the conversation ID actually changed to prevent loops
+        if (conversationId !== currentConversationIdRef.current) {
+            if (!isActivelyStreaming) {
+                console.log('[Chat] Resetting state (not streaming)');
+                resetState();
+                currentMessageIdRef.current = null;
 
-            // Only load initial messages when NOT actively streaming
-            if (initialMessages && initialMessages.length > 0) {
-                // Convert to UI message format
-                const uiMessages: Message[] = initialMessages.map(msg => ({
-                    id: msg.id,
-                    role: msg.role,
-                    content: msg.content,
-                    sources: msg.sources as SourceNode[] | undefined,
-                    isLoading: false,
-                    isStreaming: false,
-                }));
-                setMessages(uiMessages);
+                if (initialMessages && initialMessages.length > 0) {
+                    const uiMessages: Message[] = initialMessages.map(msg => ({
+                        id: msg.id,
+                        role: msg.role,
+                        content: msg.content,
+                        sources: msg.sources as SourceNode[] | undefined,
+                        isLoading: false,
+                        isStreaming: false,
+                    }));
+                    setMessages(uiMessages);
+                } else {
+                    setMessages([]);
+                }
             } else {
-                setMessages([]);
+                console.log('[Chat] Skipping reset and message load (actively streaming)');
             }
-        } else {
-            console.log('[Chat] Skipping reset and message load (actively streaming)');
+            currentConversationIdRef.current = conversationId || null;
         }
-
-        currentConversationIdRef.current = conversationId || null;
     }, [conversationId, initialMessages, resetState]);
 
     const scrollToBottom = () => {
@@ -94,14 +91,16 @@ export default function ChatInterface({
         scrollToBottom();
     }, [messages, streamState.response]);
 
+    // Track whether we were actually streaming (to detect the true done transition)
+    const wasStreamingRef = useRef(false);
+
+    // Track latest response in a ref so the done effect doesn't need it as a dependency
+    const latestResponseRef = useRef('');
+
     // Update message when streaming response changes
     useEffect(() => {
-        console.log('[Chat] Streaming update effect:', {
-            hasMessageId: !!currentMessageIdRef.current,
-            responseLength: streamState.response.length,
-            isStreaming: streamState.isStreaming
-        });
         if (currentMessageIdRef.current && streamState.response) {
+            latestResponseRef.current = streamState.response;
             setMessages(prev => prev.map(msg =>
                 msg.id === currentMessageIdRef.current
                     ? { ...msg, content: streamState.response, isLoading: false, isStreaming: streamState.isStreaming }
@@ -110,53 +109,64 @@ export default function ChatInterface({
         }
     }, [streamState.response, streamState.isStreaming]);
 
-    // Update message with sources when done and save to DB
+    // Track streaming state transitions
     useEffect(() => {
-        console.log('[Chat] Done effect:', {
-            isStreaming: streamState.isStreaming,
-            hasMessageId: !!currentMessageIdRef.current,
-            messageId: currentMessageIdRef.current,
-            responseLength: streamState.response.length,
-            sourcesCount: streamState.sources.length
-        });
-        // When streaming ends (isStreaming goes from true to false)
-        if (!streamState.isStreaming && currentMessageIdRef.current && streamState.response) {
-            console.log('[Chat] Processing done - updating message UI');
-            const sources: SourceNode[] = streamState.sources.map((s: SourceItem) => ({
-                content: s.content,
-                score: s.score,
-                type: s.type,
-                metadata: s.metadata,
-            }));
+        if (streamState.isStreaming) {
+            wasStreamingRef.current = true;
+        }
+    }, [streamState.isStreaming]);
 
-            setMessages(prev => prev.map(msg =>
-                msg.id === currentMessageIdRef.current
-                    ? {
-                        ...msg,
-                        content: streamState.response,
-                        sources: sources.length > 0 ? sources : msg.sources,
-                        isLoading: false,
-                        isStreaming: false
-                    }
-                    : msg
-            ));
+    // Update message with sources when done and save to DB
+    // Only fires on the true transition: wasStreaming=true → isStreaming=false
+    useEffect(() => {
+        if (
+            !streamState.isStreaming &&
+            wasStreamingRef.current &&
+            currentMessageIdRef.current
+        ) {
+            // Reset the transition flag immediately to prevent re-entry
+            wasStreamingRef.current = false;
+            const finalResponse = latestResponseRef.current;
 
-            // Note: Assistant message is saved by the backend (websocket.py)
-            // to avoid duplicate saves
+            if (finalResponse) {
+                console.log('[Chat] Stream completed - finalizing message');
+                const sources: SourceNode[] = streamState.sources.map((s: SourceItem) => ({
+                    content: s.content,
+                    score: s.score,
+                    type: s.type,
+                    metadata: s.metadata,
+                }));
+
+                setMessages(prev => prev.map(msg =>
+                    msg.id === currentMessageIdRef.current
+                        ? {
+                            ...msg,
+                            content: finalResponse,
+                            sources: sources.length > 0 ? sources : msg.sources,
+                            isLoading: false,
+                            isStreaming: false
+                        }
+                        : msg
+                ));
+            }
 
             currentMessageIdRef.current = null;
+            latestResponseRef.current = '';
         }
-    }, [streamState.isStreaming, streamState.sources, streamState.response]);
+    }, [streamState.isStreaming, streamState.sources]);
 
     // Handle errors
     useEffect(() => {
         if (streamState.error && currentMessageIdRef.current) {
+            console.log('[Chat] Error effect running, clearing currentMessageIdRef');
+            wasStreamingRef.current = false;
             setMessages(prev => prev.map(msg =>
                 msg.id === currentMessageIdRef.current
                     ? { ...msg, content: `Error: ${streamState.error}`, isLoading: false, isStreaming: false }
                     : msg
             ));
             currentMessageIdRef.current = null;
+            latestResponseRef.current = '';
         }
     }, [streamState.error]);
 
@@ -212,7 +222,6 @@ export default function ChatInterface({
         // Send query via WebSocket
         sendQuery(query, {
             includeSources: true,
-            detailed: true,
             conversationId: convId || undefined
         });
     };

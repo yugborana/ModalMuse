@@ -19,10 +19,10 @@ class BM25SparseEncoder:
     at index time and query time without persisting any state.
     """
 
-    def __init__(self, n_features: int = 16384, k1: float = 1.5, b: float = 0.75):
+    def __init__(self, n_features: int = 65536, k1: float = 1.5, b: float = 0.75):
         """
         Args:
-            n_features: Hash space size (2^17). Larger = fewer collisions.
+            n_features: Hash space size (2^16). Larger = fewer collisions for technical vocab.
             k1: BM25 term frequency saturation. Higher = raw TF matters more.
             b:  BM25 length normalization. 0 = no normalization, 1 = full.
         """

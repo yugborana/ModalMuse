@@ -1,4 +1,6 @@
 // API client for ModalMuse backend
+// Only includes endpoints actively used by the frontend.
+// Query operations use WebSocket (see useWebSocket.ts).
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
 
@@ -11,12 +13,6 @@ export interface SourceNode {
     score: number;
     type: 'text' | 'image';
     metadata: Record<string, unknown>;
-}
-
-export interface QueryResponse {
-    answer: string;
-    sources: SourceNode[] | null;
-    query: string;
 }
 
 export interface IndexingStatus {
@@ -41,66 +37,6 @@ export interface CollectionStats {
         points_count: number;
         status: string;
     };
-}
-
-// ═══════════════════════════════════════════════════════════════════
-// QUERY API
-// ═══════════════════════════════════════════════════════════════════
-
-export async function queryRAG(query: string): Promise<QueryResponse> {
-    const response = await fetch(`${API_BASE}/api/query/`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ query, include_sources: true }),
-    });
-
-    if (!response.ok) {
-        const error = await response.json();
-        throw new Error(error.detail || 'Query failed');
-    }
-
-    return response.json();
-}
-
-// Streaming query (returns async generator)
-export async function* queryRAGStream(query: string): AsyncGenerator<string, void, unknown> {
-    const response = await fetch(`${API_BASE}/api/query/stream`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ query }),
-    });
-
-    if (!response.ok) {
-        throw new Error('Stream query failed');
-    }
-
-    const reader = response.body?.getReader();
-    if (!reader) throw new Error('No response body');
-
-    const decoder = new TextDecoder();
-    let buffer = '';
-
-    while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n');
-        buffer = lines.pop() || '';
-
-        for (const line of lines) {
-            if (line.startsWith('data: ')) {
-                const data = line.slice(6);
-                if (data === '[DONE]') return;
-                try {
-                    const parsed = JSON.parse(data);
-                    if (parsed.chunk) yield parsed.chunk;
-                } catch {
-                    yield data;
-                }
-            }
-        }
-    }
 }
 
 // ═══════════════════════════════════════════════════════════════════

@@ -109,9 +109,7 @@ def index_document_sync(file_path: str, task_id: str) -> None:
         
         # Invalidate semantic response cache (answers may be stale)
         try:
-            from qdrant_manager import QdrantManager
-            q = QdrantManager(url=config.QDRANT_URL, api_key=config.QDRANT_API_KEY)
-            q.clear_response_cache()
+            SharedResources.get_qdrant_manager().clear_response_cache()
         except Exception as cache_err:
             print(f"[WARN] Could not clear response cache: {cache_err}")
         
@@ -167,8 +165,9 @@ async def upload_and_index(
     # Create data directory if it doesn't exist
     config.DATA_DIR.mkdir(parents=True, exist_ok=True)
     
-    # Save the uploaded file
-    file_path = config.DATA_DIR / file.filename
+    # Save the uploaded file with a unique name to prevent Windows locking errors
+    unique_filename = f"{uuid.uuid4().hex}_{file.filename}"
+    file_path = config.DATA_DIR / unique_filename
     
     async with aiofiles.open(file_path, 'wb') as out_file:
         content = await file.read()

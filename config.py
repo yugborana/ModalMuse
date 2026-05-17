@@ -18,15 +18,23 @@ GROQ_MODEL_NAME = "meta-llama/llama-4-scout-17b-16e-instruct"
 LLM_MAX_NEW_TOKENS = 1024
 LLM_TEMPERATURE = 0.7
 
-# --- Jina AI Embeddings Configuration ---
-JINA_API_KEY = os.getenv("JINA_API_KEY", "")
-JINA_EMBED_MODEL = "jina-embeddings-v4"
-JINA_EMBED_DIMENSIONS = 1024  # Can be 256-2048, lower = faster/cheaper
-JINA_RERANK_MODEL = "jina-reranker-v2-base-multilingual"
+# --- Local Embedding Server (Infinity via Docker) ---
+LOCAL_EMBED_URL = os.getenv("LOCAL_EMBED_URL", "http://localhost:7997")
 
-# Image embedding batch configuration (Jina free tier: 100K tokens/min)
-JINA_IMAGE_BATCH_SIZE = 2      # Images per API batch (keep small — images are token-heavy)
-JINA_BATCH_DELAY_SECONDS = 35   # Delay between batches to avoid rate limit (60s window + buffer)
+# Text Embeddings (bge-small — fast, 384-dim, text-only)
+LOCAL_TEXT_MODEL = "BAAI/bge-small-en-v1.5"
+LOCAL_TEXT_DIMENSIONS = 384
+
+# Image Embeddings (jina-clip — multimodal, 768-dim, images + text→image)
+LOCAL_IMAGE_MODEL = "jinaai/jina-clip-v1"
+LOCAL_IMAGE_DIMENSIONS = 768
+
+# Reranker
+LOCAL_RERANK_MODEL = "BAAI/bge-reranker-base"
+
+# Image embedding batch configuration (no rate limits locally)
+LOCAL_IMAGE_BATCH_SIZE = 10     
+LOCAL_BATCH_DELAY_SECONDS = 0   
 
 
 # --- Qdrant Configuration ---
@@ -44,11 +52,12 @@ API_PORT = int(os.getenv("API_PORT", "8000"))
 CORS_ORIGINS = os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",")
 
 # --- Retrieval Configuration ---
-TEXT_SIMILARITY_TOP_K = 7   # Top-K from dense (Jina) retriever
-SPARSE_TOP_K = 7            # Top-K from sparse (BM25) retriever
+TEXT_SIMILARITY_TOP_K = 10  # Top-K from dense retriever (more candidates for reranker)
+SPARSE_TOP_K = 10           # Top-K from sparse (BM25) retriever
 IMAGE_SIMILARITY_TOP_K = 5
 RRF_K = 60                  # RRF constant (standard value)
-FINAL_RERANK_TOP_N = 5      # Top-N after reranking fused results
+FINAL_RERANK_TOP_N = 7      # Total results after reranking (text + images)
+IMAGE_RESULT_SLOTS = 2      # Guaranteed image slots in final results (rest = text)
 
 # --- Semantic Response Cache ---
 RESPONSE_CACHE_COLLECTION = "response_cache"
@@ -65,6 +74,10 @@ SUPABASE_STORAGE_ENABLED = os.getenv("SUPABASE_STORAGE_ENABLED", "true").lower()
 # When True: Upload downloaded images to Supabase storage bucket
 # When False: Save images to local downloaded_images/ folder
 
+# --- Text Chunking Configuration ---
+CHUNK_SIZE = 512            # Tokens per chunk (smaller = more precise retrieval with bge-small)
+CHUNK_OVERLAP = 50          # Token overlap between adjacent chunks
+
 # --- Validation ---
 def validate_config():
     """Validate that required configuration is present."""
@@ -75,9 +88,6 @@ def validate_config():
     
     if not GROQ_API_KEY:
         errors.append("GROQ_API_KEY is not set. Set it in .env file.")
-    
-    if not JINA_API_KEY:
-        errors.append("JINA_API_KEY is not set. Get one at jina.ai/embeddings")
     
     if errors:
         print("[WARN]  Configuration Errors:")

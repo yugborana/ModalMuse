@@ -51,12 +51,12 @@ app = FastAPI(
 ModalMuse is a multi-modal Retrieval-Augmented Generation system that can:
 
 - **Index PDF documents** with text and image extraction using LlamaParse
-- **Dense retrieval** using Jina v4 embeddings with Jina reranking
-- **Generate answers** using Groq LLM (Llama 4 Maverick)
+- **Dense retrieval** using local BGE/Jina-CLIP embeddings via Infinity server
+- **Generate answers** using Groq LLM (Llama 4 Scout)
 
 ### Features
 - [DOC] PDF document indexing with image extraction
-- [SEARCH] Dense text search with Jina reranking
+- [SEARCH] Hybrid dense + sparse text search with local reranking
 - 🖼️ Multi-modal image retrieval
 - 🤖 LLM inference with Groq
 - ⚡ Async endpoints with streaming support
@@ -119,7 +119,7 @@ async def health_check():
         "qdrant": False,
         "services": {
             "groq_llm": bool(config.GROQ_API_KEY),
-            "jina_embeddings": bool(config.JINA_API_KEY),
+            "local_embeddings": False,
         },
     }
     
@@ -138,10 +138,18 @@ async def health_check():
     except Exception:
         health["qdrant"] = False
     
+    # Check local Infinity embedding server
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.get(f"{config.LOCAL_EMBED_URL}/models")
+            health["services"]["local_embeddings"] = response.status_code == 200
+    except Exception:
+        health["services"]["local_embeddings"] = False
+    
     # Overall status
     if not health["qdrant"]:
         health["status"] = "degraded"
-    if not health["services"]["groq_llm"] or not health["services"]["jina_embeddings"]:
+    if not health["services"]["groq_llm"] or not health["services"]["local_embeddings"]:
         health["status"] = "degraded"
     
     return health

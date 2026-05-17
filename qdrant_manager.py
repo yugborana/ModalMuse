@@ -73,11 +73,18 @@ class QdrantManager:
             print(f"[ERROR] Failed to create text collection: {e}")
             raise
 
-    def create_image_collection(self, image_dim: int):
-        """Creates the image collection with a dense vector index.
+    def create_image_collection(self, image_dim: int, caption_dim: int = None):
+        """Creates the image collection with visual + caption vector indices.
+        
+        Args:
+            image_dim: Dimension for image-visual vectors (e.g. 768 for jina-clip)
+            caption_dim: Dimension for caption-text vectors (e.g. 384 for bge-small).
+                         Defaults to image_dim if not specified.
         
         Uses get_or_create pattern to avoid destroying existing indexed data.
         """
+        caption_dim = caption_dim or image_dim
+        
         # Check if collection already exists
         collections = self.client.get_collections().collections
         collection_names = [c.name for c in collections]
@@ -91,12 +98,12 @@ class QdrantManager:
                         distance=models.Distance.COSINE
                     ),
                     "caption-text": models.VectorParams(
-                        size=image_dim,  # Same Jina model embeds both text & images
+                        size=caption_dim,  # Text model embeds captions (may differ from image dim)
                         distance=models.Distance.COSINE
                     )
                 }
             )
-            print(f"[OK] Created image collection: {self.image_collection_name} (visual + caption vectors)")
+            print(f"[OK] Created image collection: {self.image_collection_name} (visual:{image_dim}d + caption:{caption_dim}d)")
         else:
             print(f"[OK] Image collection already exists: {self.image_collection_name}")
 
@@ -354,7 +361,7 @@ class QdrantManager:
         try:
             # Delete and recreate the collection
             self.client.delete_collection(config.RESPONSE_CACHE_COLLECTION)
-            self.create_response_cache_collection(1024)  # Jina v4 dim
+            self.create_response_cache_collection(config.LOCAL_TEXT_DIMENSIONS)
             print("[CACHE] Response cache cleared (new documents indexed)")
         except Exception as e:
             print(f"[WARN] Could not clear response cache: {e}")

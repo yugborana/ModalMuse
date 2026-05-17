@@ -1,15 +1,15 @@
-# retriever.py - Multi-Modal Hybrid Retriever with Jina + BM25
+# retriever.py - Multi-Modal Hybrid Retriever with Local Embeddings + BM25
 """
 Orchestrates Multi-Modal Hybrid Retrieval:
-  - Dense search via Jina AI embeddings
+  - Dense search via local Infinity embeddings (jina-clip-v1)
   - Sparse search via local BM25 (HashingVectorizer)
   - RRF fusion of dense + sparse text results
-  - Jina reranking of fused text + images
+  - Local reranking of fused text + images
   - Groq LLM response generation
 """
 
 import asyncio
-from typing import List, Union, Dict, Any, Optional
+from typing import List, Union, Dict, Any, Optional, Tuple
 
 from qdrant_manager import QdrantManager
 from qdrant_client.http.models import SparseVector
@@ -22,7 +22,7 @@ from llama_index.core.schema import NodeWithScore, ImageNode, TextNode
 from llama_index.core.query_engine import CustomQueryEngine
 from llama_index.core.base.response.schema import Response
 
-from jina_client import JinaEmbeddings, JinaReranker
+from local_client import LocalEmbeddings, LocalReranker
 from bm25 import BM25SparseEncoder
 from rrf_reranker import rrf_fuse
 
@@ -33,80 +33,74 @@ from groq import AsyncGroq
 
 class MultiModalRetriever(BaseRetriever):
     """
-    Multi-Modal Retriever using Jina AI for embeddings and reranking.
+    Multi-Modal Retriever using local Infinity server for embeddings and reranking.
+    Uses separate text (bge-small) and image (jina-clip) embedding models.
     """
     
     def __init__(self, qdrant_manager: QdrantManager):
         super().__init__()
         self.qdrant_manager = qdrant_manager
         
-        print("[LOADING] Initializing Jina Embeddings, BM25 Sparse Encoder, and Reranker...")
+        print("[LOADING] Initializing Local Embeddings, BM25 Sparse Encoder, and Reranker...")
         
-        # 1. Initialize Jina Embeddings (same model for text and images)
-        self.embedder = JinaEmbeddings(dimensions=config.JINA_EMBED_DIMENSIONS)
-        self.reranker = JinaReranker()
+        # 1. Initialize separate text and image embedders
+        self.text_embedder = LocalEmbeddings(
+            model=config.LOCAL_TEXT_MODEL,
+            dimensions=config.LOCAL_TEXT_DIMENSIONS
+        )
+        self.image_embedder = LocalEmbeddings(
+            model=config.LOCAL_IMAGE_MODEL,
+            dimensions=config.LOCAL_IMAGE_DIMENSIONS
+        )
+        # Backward compat alias (used by aembed_query cache flow)
+        self.embedder = self.text_embedder
+        self.reranker = LocalReranker()
         
         # 2. Initialize BM25 Sparse Encoder (local, no API)
         self.sparse_encoder = BM25SparseEncoder()
         
-        # 3. Get Vector Stores from Qdrant
-        self.text_store = qdrant_manager.get_text_vector_store()
-        self.image_store = qdrant_manager.get_image_vector_store()
+        # Note: We query Qdrant directly via async_client.query_points()
+        # LlamaIndex QdrantVectorStore is not used in the retrieval pipeline.
         
+        print(f"[OK] Text Embedder: {config.LOCAL_TEXT_MODEL} ({config.LOCAL_TEXT_DIMENSIONS}-dim)")
+        print(f"[OK] Image Embedder: {config.LOCAL_IMAGE_MODEL} ({config.LOCAL_IMAGE_DIMENSIONS}-dim)")
         print("[OK] Hybrid Retriever Ready (Dense + Sparse + Reranker)")
 
-    async def _get_cached_embedding(self, query_str: str) -> List[float]:
-        """Get query embedding with Supabase cache layer.
-        
-        Checks Supabase query_cache first to avoid redundant Jina API calls.
-        Falls back to direct embedding if Supabase is unavailable.
-        """
-        try:
-            from supabase_client import get_cached_embedding, cache_embedding
-            
-            # Check cache first
-            cached = await get_cached_embedding(query_str)
-            if cached:
-                print(f"   [CACHE] Embedding cache hit for: '{query_str[:40]}...'")
-                return cached
-            
-            # Cache miss — embed via Jina API
-            embedding = await self.embedder.aembed_query(query_str)
-            
-            # Store in cache for future reuse
-            try:
-                await cache_embedding(query_str, embedding)
-            except Exception as e:
-                print(f"   [WARN] Failed to cache embedding: {e}")
-            
-            return embedding
-            
-        except ImportError:
-            # Supabase not available — direct embed
-            return await self.embedder.aembed_query(query_str)
+    # Removed `_get_cached_embedding` since local Infinity embeddings are instantaneous,
 
     
-    async def _aretrieve(self, query_bundle: QueryBundle) -> List[NodeWithScore]:
-        """Async hybrid retrieval: [Dense ∥ Sparse ∥ Image] → RRF → Rerank → Return."""
+    async def _retrieve_hybrid(self, query_str: str, text_query_embedding: List[float], image_query_embedding: List[float]) -> Dict:
+        """Core hybrid retrieval pipeline returning detailed intermediate results.
+        
+        This is the single source of truth for the retrieval pipeline.
+        Both `_aretrieve` (non-streaming) and `astream_query_detailed` (streaming) call this.
+        
+        Pipeline:
+          Text:  [Dense ∥ Sparse] → RRF Fusion
+          Image: [Caption-text ∥ Visual] → Deduplicate
+          All:   [Fused text + Images] → Unified Cross-Encoder Rerank → Slot allocation
+          Final: Top text_slots text + Top image_slots images
+        
+        Returns:
+            Dict with keys: dense_nodes, sparse_nodes, image_nodes, fused_text,
+                            reranked_text, reranked_images, all_nodes, timings
+        """
         import time
-        start_time = time.perf_counter()
-        query_str = query_bundle.query_str
         
-        print(f"[HYBRID SEARCH] Retrieving for: '{query_str}'")
+        # Configurable slot allocation
+        image_slots = getattr(config, 'IMAGE_RESULT_SLOTS', 2)
+        text_slots = config.FINAL_RERANK_TOP_N - image_slots
         
-        # ── Step 1: Get query embeddings (dense + sparse) ──
-        embed_start = time.perf_counter()
-        query_embedding = await self._get_cached_embedding(query_str)
+        # ── Step 1: Sparse query (local, instant) ──
         sparse_query = self.sparse_encoder.encode_query(query_str)
-        print(f"   [PERF] Embedding: {(time.perf_counter() - embed_start)*1000:.0f}ms")
         
-        # ── Step 2: PARALLEL Dense + Sparse + Image(visual) + Image(caption) Search ──
+        # ── Step 2: PARALLEL 4-way Search ──
         search_start = time.perf_counter()
         
         dense_results, sparse_results, image_visual_results, image_caption_results = await asyncio.gather(
             self.qdrant_manager.async_client.query_points(
                 collection_name=config.TEXT_COLLECTION_NAME,
-                query=query_embedding,
+                query=text_query_embedding,
                 using="text-dense",
                 limit=config.TEXT_SIMILARITY_TOP_K,
                 with_payload=True
@@ -123,53 +117,121 @@ class MultiModalRetriever(BaseRetriever):
             ),
             self.qdrant_manager.async_client.query_points(
                 collection_name=config.IMAGE_COLLECTION_NAME,
-                query=query_embedding,
+                query=image_query_embedding,
                 using="image-visual",
                 limit=config.IMAGE_SIMILARITY_TOP_K,
                 with_payload=True
             ),
             self.qdrant_manager.async_client.query_points(
                 collection_name=config.IMAGE_COLLECTION_NAME,
-                query=query_embedding,
+                query=text_query_embedding,
                 using="caption-text",
                 limit=config.IMAGE_SIMILARITY_TOP_K,
                 with_payload=True
             )
         )
-        print(f"   [PERF] Parallel search: {(time.perf_counter() - search_start)*1000:.0f}ms")
+        search_time = (time.perf_counter() - search_start) * 1000
         
         # Convert results
         dense_nodes = self._points_to_text_nodes(dense_results.points)
         sparse_nodes = self._points_to_text_nodes(sparse_results.points)
         
-        # Merge visual + caption image results (deduplicate by node ID)
-        visual_nodes = self._points_to_image_nodes(image_visual_results.points)
+        # Merge image results: prioritize caption-text over visual
         caption_nodes = self._points_to_image_nodes(image_caption_results.points)
+        visual_nodes = self._points_to_image_nodes(image_visual_results.points)
         seen_image_ids = set()
         image_nodes = []
-        for n in visual_nodes + caption_nodes:
+        for n in caption_nodes:
+            if n.node.node_id not in seen_image_ids:
+                seen_image_ids.add(n.node.node_id)
+                image_nodes.append(n)
+        for n in visual_nodes:
             if n.node.node_id not in seen_image_ids:
                 seen_image_ids.add(n.node.node_id)
                 image_nodes.append(n)
         
-        print(f"   [DENSE] {len(dense_nodes)}, [SPARSE] {len(sparse_nodes)}, [IMAGE] {len(image_nodes)} (visual:{len(visual_nodes)} + caption:{len(caption_nodes)})")
+        print(f"   [DENSE] {len(dense_nodes)}, [SPARSE] {len(sparse_nodes)}, [IMAGE] {len(image_nodes)} (caption:{len(caption_nodes)} + visual:{len(visual_nodes)})")
         
-        # ── Step 3: RRF Fusion (dense + sparse text) ──
-        rrf_start = time.perf_counter()
+        # ── Step 3: RRF Fusion (dense + sparse text only) ──
         fused_text = rrf_fuse(dense_nodes, sparse_nodes)
-        print(f"   [RRF] Fused → {len(fused_text)} unique text nodes ({(time.perf_counter() - rrf_start)*1000:.0f}ms)")
+        print(f"   [RRF] Fused → {len(fused_text)} unique text nodes")
         
-        # ── Step 4: Rerank fused text + images ──
+        # ── Step 4: Unified Reranking (text + images together) ──
+        # With rich captions (domain terms + visible text + keywords), the
+        # cross-encoder can now meaningfully compare image captions against
+        # text passages. We rerank all candidates in a single pass, then
+        # allocate the top results into text/image slots.
         rerank_start = time.perf_counter()
-        combined = fused_text + image_nodes
-        final_nodes = await self._arerank_nodes(query_str, combined, config.FINAL_RERANK_TOP_N)
-        print(f"   [PERF] Reranking: {(time.perf_counter() - rerank_start)*1000:.0f}ms")
-        print(f"   [RANK] Final: {len(final_nodes)} nodes")
+        
+        # Combine all candidates for unified reranking
+        all_candidates = fused_text + image_nodes
+        total_rerank_slots = config.FINAL_RERANK_TOP_N + 4  # Over-fetch to ensure enough of each type
+        
+        reranked_all = await self._arerank_nodes(query_str, all_candidates, total_rerank_slots)
+        rerank_time = (time.perf_counter() - rerank_start) * 1000
+        
+        # Split reranked results back into text and image buckets
+        reranked_text = []
+        reranked_images = []
+        for node in reranked_all:
+            is_image = "image_path" in (node.node.metadata or {})
+            if is_image and len(reranked_images) < image_slots:
+                reranked_images.append(node)
+            elif not is_image and len(reranked_text) < text_slots:
+                reranked_text.append(node)
+            # Stop once both buckets are full
+            if len(reranked_text) >= text_slots and len(reranked_images) >= image_slots:
+                break
+        
+        all_nodes = reranked_text + reranked_images
+        
+        # Log what got selected
+        for n in reranked_text:
+            print(f"   [TEXT] score={n.score:.4f} page={n.node.metadata.get('page','?')} text={n.node.get_content()[:60]}...")
+        for n in reranked_images:
+            print(f"   [IMG]  score={n.score:.4f} page={n.node.metadata.get('page','?')} caption={n.node.metadata.get('caption','')[:60]}...")
+        
+        return {
+            "dense_nodes": dense_nodes,
+            "sparse_nodes": sparse_nodes,
+            "image_nodes": image_nodes,
+            "fused_text": fused_text,
+            "reranked_text": reranked_text,
+            "reranked_images": reranked_images,
+            "all_nodes": all_nodes,
+            "timings": {
+                "search_ms": search_time,
+                "rerank_ms": rerank_time,
+            }
+        }
+
+    async def _aretrieve(self, query_bundle: QueryBundle) -> List[NodeWithScore]:
+        """Async hybrid retrieval — thin wrapper around _retrieve_hybrid.
+        
+        Handles embedding, then delegates to the shared pipeline.
+        """
+        import time
+        start_time = time.perf_counter()
+        query_str = query_bundle.query_str
+        
+        print(f"[HYBRID SEARCH] Retrieving for: '{query_str}'")
+        
+        # Step 1: Get query embeddings (text + image in parallel)
+        embed_start = time.perf_counter()
+        text_query_embedding, image_query_embedding = await asyncio.gather(
+            self.embedder.aembed_query(query_str),
+            self.image_embedder.aembed_query(query_str),
+        )
+        print(f"   [PERF] Embedding: {(time.perf_counter() - embed_start)*1000:.0f}ms")
+        
+        # Step 2: Run shared retrieval pipeline
+        result = await self._retrieve_hybrid(query_str, text_query_embedding, image_query_embedding)
         
         total_time = (time.perf_counter() - start_time) * 1000
-        print(f"[OK] Final: {len(final_nodes)} nodes in {total_time:.0f}ms")
+        all_nodes = result["all_nodes"]
+        print(f"[OK] Final: {len(all_nodes)} nodes ({len(result['reranked_text'])} text + {len(result['reranked_images'])} images) in {total_time:.0f}ms")
         
-        return final_nodes
+        return all_nodes
     
     def _retrieve(self, query_bundle: QueryBundle) -> List[NodeWithScore]:
         """Sync fallback — required by BaseRetriever abstract class."""
@@ -238,8 +300,12 @@ class MultiModalRetriever(BaseRetriever):
     
     
     async def _arerank_nodes(self, query: str, nodes: List[NodeWithScore], top_n: int) -> List[NodeWithScore]:
-        """Async rerank a list of nodes using Jina Reranker."""
+        """Async rerank a list of nodes using Local Reranker."""
         if not nodes:
+            return []
+        # Clamp top_n to available nodes
+        top_n = min(top_n, len(nodes))
+        if top_n <= 0:
             return []
         documents = [self._get_rerank_text(n) for n in nodes]
         rerank_results = await self.reranker.arerank(query, documents, top_n=top_n)
@@ -282,7 +348,7 @@ class GroqGenerator(CustomQueryEngine):
             model_name=resolved_model,
         )
 
-    def _encode_image(self, image_path: str, max_pixels: int = 30000000) -> str:
+    async def _encode_image(self, image_path: str, max_pixels: int = 30000000) -> str:
         """Encode image file or URL to base64 string, resizing if too large.
         
         Supports:
@@ -300,12 +366,13 @@ class GroqGenerator(CustomQueryEngine):
             is_url = image_path.startswith('http://') or image_path.startswith('https://')
             
             if is_url:
-                # Download image from URL
+                # Download image from URL (async to avoid blocking event loop)
                 print(f"   [IMG] Fetching from URL: {image_path[:60]}...")
-                with httpx.Client(timeout=30.0) as client:
-                    response = client.get(image_path)
-                    response.raise_for_status()
-                    image_data = io.BytesIO(response.content)
+                from local_client import get_async_client
+                client = get_async_client()
+                response = await client.get(image_path)
+                response.raise_for_status()
+                image_data = io.BytesIO(response.content)
                 img = Image.open(image_data)
             else:
                 # Open local file
@@ -348,7 +415,7 @@ class GroqGenerator(CustomQueryEngine):
             
             return ""  # Return empty string if all fails
 
-    def _construct_messages(self, query_str: str, text_context: List[str], image_paths: List[str]) -> List[Dict]:
+    async def _construct_messages(self, query_str: str, text_context: List[str], image_paths: List[str]) -> List[Dict]:
         """Construct the message payload for Groq API."""
         # Number sources for citation
         context_str = "\n\n".join([f"[Source {i+1}]: {ctx}" for i, ctx in enumerate(text_context)])
@@ -377,7 +444,7 @@ class GroqGenerator(CustomQueryEngine):
         # Add images
         for img_path in image_paths:
             try:
-                base64_image = self._encode_image(img_path)
+                base64_image = await self._encode_image(img_path)
                 
                 # Skip empty/failed encodings
                 if not base64_image:
@@ -428,21 +495,11 @@ class GroqGenerator(CustomQueryEngine):
         import asyncio
         return asyncio.get_event_loop().run_until_complete(self.acustom_query(query_str))
 
-    async def acustom_query(self, query_bundle: Union[str, QueryBundle]) -> Response:
-        """Execute a query with async retrieval, semantic cache, and Groq generation."""
-        if isinstance(query_bundle, str):
-            query_bundle = QueryBundle(query_bundle)
-        
-        query_str = query_bundle.query_str
-        
-        # 1. Embed query (needed for both cache check and retrieval)
-        query_embedding = await self.retriever._get_cached_embedding(query_str)
-        
-        # 2. Check semantic cache
+    async def _check_semantic_cache(self, query_embedding: List[float]) -> Optional[Response]:
+        """Check semantic cache and return a fully formed Response if hit."""
         try:
             cached = await self.retriever.qdrant_manager.search_response_cache(query_embedding)
             if cached:
-                # Reconstruct nodes from cached sources
                 cached_nodes = []
                 for src in (cached.get("sources") or []):
                     node = TextNode(text=src.get("content", ""), metadata=src.get("metadata", {}))
@@ -450,14 +507,12 @@ class GroqGenerator(CustomQueryEngine):
                 return Response(response=cached["response"], source_nodes=cached_nodes)
         except Exception as e:
             print(f"   [WARN] Cache check failed: {e}")
-        
-        # 3. Retrieve (Async)
-        nodes: List[NodeWithScore] = await self.retriever._aretrieve(query_bundle)
-        
-        # 4. Separate Text and Images
+        return None
+
+    def _separate_nodes(self, nodes: List[NodeWithScore]) -> Tuple[List[str], List[str]]:
+        """Separate retrieved nodes into text contexts and image paths."""
         text_context = []
         image_paths = []
-        
         for node in nodes:
             if isinstance(node.node, ImageNode) or 'image_path' in node.metadata:
                 img_path = node.metadata.get('image_path')
@@ -465,24 +520,10 @@ class GroqGenerator(CustomQueryEngine):
                     image_paths.append(img_path)
             else:
                 text_context.append(node.get_content())
-        
-        # 5. Construct Messages
-        messages = self._construct_messages(query_str, text_context, image_paths)
-        
-        # 6. Generate Answer (Async)
-        try:
-            completion = await self.aclient.chat.completions.create(
-                model=self.model_name,
-                messages=messages,
-                temperature=config.LLM_TEMPERATURE,
-                max_tokens=config.LLM_MAX_NEW_TOKENS,
-                stream=False
-            )
-            response_text = completion.choices[0].message.content
-        except Exception as e:
-            response_text = f"Error generating response: {e}"
-        
-        # 7. Store in semantic cache
+        return text_context, image_paths
+
+    async def _store_response_cache(self, query_embedding: List[float], query_str: str, response_text: str, nodes: List[NodeWithScore]) -> None:
+        """Store the generated response and sources in the semantic cache."""
         try:
             sources_for_cache = []
             for node in nodes:
@@ -502,6 +543,55 @@ class GroqGenerator(CustomQueryEngine):
             )
         except Exception as e:
             print(f"   [WARN] Cache store failed: {e}")
+
+    async def acustom_query(self, query_bundle: Union[str, QueryBundle]) -> Response:
+        """Execute a query with async retrieval, semantic cache, and Groq generation."""
+        if isinstance(query_bundle, str):
+            query_bundle = QueryBundle(query_bundle)
+        
+        original_query = query_bundle.query_str
+        query_str = original_query
+        
+        # 1. Expand short/vague queries for better retrieval
+        if len(query_str.split()) <= 8:
+            rewritten = await self._rewrite_query(query_str)
+            if rewritten and rewritten != query_str:
+                query_str = rewritten
+                print(f"   [REWRITE] '{original_query}' → '{query_str}'")
+                query_bundle.query_str = query_str
+        
+        # 2. Embed query
+        query_embedding = await self.retriever.embedder.aembed_query(query_str)
+        
+        # 3. Check semantic cache
+        cached_response = await self._check_semantic_cache(query_embedding)
+        if cached_response:
+            return cached_response
+        
+        # 4. Retrieve (Async)
+        nodes: List[NodeWithScore] = await self.retriever._aretrieve(query_bundle)
+        
+        # 5. Separate Text and Images
+        text_context, image_paths = self._separate_nodes(nodes)
+        
+        # 6. Construct Messages
+        messages = await self._construct_messages(query_str, text_context, image_paths)
+        
+        # 7. Generate Answer (Async)
+        try:
+            completion = await self.aclient.chat.completions.create(
+                model=self.model_name,
+                messages=messages,
+                temperature=config.LLM_TEMPERATURE,
+                max_tokens=config.LLM_MAX_NEW_TOKENS,
+                stream=False
+            )
+            response_text = completion.choices[0].message.content
+        except Exception as e:
+            response_text = f"Error generating response: {e}"
+        
+        # 8. Store in semantic cache
+        await self._store_response_cache(query_embedding, query_str, response_text, nodes)
         
         return Response(response=response_text, source_nodes=nodes)
     
@@ -552,7 +642,10 @@ class GroqGenerator(CustomQueryEngine):
             }
         
         embed_start = time.perf_counter()
-        query_embedding = await self.retriever._get_cached_embedding(query_str)
+        query_embedding, image_query_embedding = await asyncio.gather(
+            self.retriever.embedder.aembed_query(query_str),
+            self.retriever.image_embedder.aembed_query(query_str),
+        )
         embed_time = (time.perf_counter() - embed_start) * 1000
         
         embed_msg = f"✓ Embedding created ({embed_time:.0f}ms)"
@@ -608,7 +701,7 @@ class GroqGenerator(CustomQueryEngine):
             print(f"   [WARN] Cache check failed: {e}")
         
         # ═══════════════════════════════════════════════════════════════
-        # PHASE 2: HYBRID SEARCH (Dense + Sparse + Image)
+        # PHASE 2+3+4: HYBRID SEARCH + FUSION + RERANKING (shared pipeline)
         # ═══════════════════════════════════════════════════════════════
         yield {
             "type": "phase",
@@ -617,62 +710,15 @@ class GroqGenerator(CustomQueryEngine):
             "message": "🔍 Searching dense, sparse & image vectors..."
         }
         
-        search_start = time.perf_counter()
+        # Delegate to the single shared retrieval pipeline
+        result = await self.retriever._retrieve_hybrid(query_str, query_embedding, image_query_embedding)
         
-        # Generate sparse query vector (local, instant)
-        sparse_query = self.retriever.sparse_encoder.encode_query(query_str)
+        dense_nodes = result["dense_nodes"]
+        sparse_nodes = result["sparse_nodes"]
+        image_nodes = result["image_nodes"]
+        search_time = result["timings"]["search_ms"]
         
-        # Parallel 4-way search (text dense + text sparse + image visual + image caption)
-        dense_results, sparse_results, image_visual_results, image_caption_results = await asyncio.gather(
-            self.retriever.qdrant_manager.async_client.query_points(
-                collection_name=config.TEXT_COLLECTION_NAME,
-                query=query_embedding,
-                using="text-dense",
-                limit=config.TEXT_SIMILARITY_TOP_K,
-                with_payload=True
-            ),
-            self.retriever.qdrant_manager.async_client.query_points(
-                collection_name=config.TEXT_COLLECTION_NAME,
-                query=SparseVector(
-                    indices=sparse_query["indices"],
-                    values=sparse_query["values"]
-                ),
-                using="text-sparse",
-                limit=config.SPARSE_TOP_K,
-                with_payload=True
-            ),
-            self.retriever.qdrant_manager.async_client.query_points(
-                collection_name=config.IMAGE_COLLECTION_NAME,
-                query=query_embedding,
-                using="image-visual",
-                limit=config.IMAGE_SIMILARITY_TOP_K,
-                with_payload=True
-            ),
-            self.retriever.qdrant_manager.async_client.query_points(
-                collection_name=config.IMAGE_COLLECTION_NAME,
-                query=query_embedding,
-                using="caption-text",
-                limit=config.IMAGE_SIMILARITY_TOP_K,
-                with_payload=True
-            )
-        )
-        search_time = (time.perf_counter() - search_start) * 1000
-        
-        # Convert to nodes
-        dense_nodes = self.retriever._points_to_text_nodes(dense_results.points)
-        sparse_nodes = self.retriever._points_to_text_nodes(sparse_results.points)
-        
-        # Merge visual + caption image results (deduplicate by node ID)
-        visual_nodes = self.retriever._points_to_image_nodes(image_visual_results.points)
-        caption_nodes = self.retriever._points_to_image_nodes(image_caption_results.points)
-        seen_image_ids = set()
-        image_nodes = []
-        for n in visual_nodes + caption_nodes:
-            if n.node.node_id not in seen_image_ids:
-                seen_image_ids.add(n.node.node_id)
-                image_nodes.append(n)
-        
-        # Emit found chunks
+        # Emit search results
         yield {
             "type": "chunks_found",
             "text_count": len(dense_nodes) + len(sparse_nodes),
@@ -693,7 +739,7 @@ class GroqGenerator(CustomQueryEngine):
             ] + [
                 {
                     "id": n.node.id_,
-                    "preview": n.node.metadata.get("image_path", "")[-50:] if n.node.metadata else "",
+                    "preview": n.node.metadata.get("caption", "")[:100] if n.node.metadata else "",
                     "score": n.score,
                     "type": "image",
                     "metadata": dict(n.node.metadata) if n.node.metadata else {}
@@ -702,18 +748,8 @@ class GroqGenerator(CustomQueryEngine):
             ]
         }
         
-        # ═══════════════════════════════════════════════════════════════
-        # PHASE 3: RRF FUSION (dense + sparse text)
-        # ═══════════════════════════════════════════════════════════════
-        yield {
-            "type": "phase",
-            "phase": "fusion",
-            "status": "started",
-            "message": "🔀 RRF fusing dense + sparse text results..."
-        }
-        
-        fused_text = rrf_fuse(dense_nodes, sparse_nodes)
-        
+        # Emit fusion phase
+        fused_text = result["fused_text"]
         yield {
             "type": "phase",
             "phase": "fusion",
@@ -721,39 +757,31 @@ class GroqGenerator(CustomQueryEngine):
             "message": f"✓ RRF fused → {len(fused_text)} unique text nodes"
         }
         
-        # ═══════════════════════════════════════════════════════════════
-        # PHASE 4: RERANKING (fused text + images)
-        # ═══════════════════════════════════════════════════════════════
-        yield {
-            "type": "phase",
-            "phase": "reranking",
-            "status": "started",
-            "message": "⚖️ Reranking fused text + images..."
-        }
-        
-        rerank_start = time.perf_counter()
-        combined = fused_text + image_nodes
-        all_nodes = await self.retriever._arerank_nodes(query_str, combined, config.FINAL_RERANK_TOP_N)
-        rerank_time = (time.perf_counter() - rerank_start) * 1000
+        # Emit reranking phase
+        reranked_text = result["reranked_text"]
+        reranked_images = result["reranked_images"]
+        all_nodes = result["all_nodes"]
+        rerank_time = result["timings"]["rerank_ms"]
         
         yield {
             "type": "phase",
             "phase": "reranking",
             "status": "completed",
-            "message": f"✓ Reranked → {len(all_nodes)} results ({rerank_time:.0f}ms)",
+            "message": f"✓ Reranked → {len(reranked_text)} text + {len(reranked_images)} images ({rerank_time:.0f}ms)",
             "duration_ms": rerank_time,
             "reranked": [
                 {
                     "id": n.node.id_,
                     "score": n.score,
+                    "type": "image" if "image_path" in (n.node.metadata or {}) else "text",
                     "preview": n.node.get_content()[:100] + "..."
                 }
-                for n in all_nodes[:5]
+                for n in all_nodes[:7]
             ]
         }
         
         # ═══════════════════════════════════════════════════════════════
-        # PHASE 4: LLM GENERATION
+        # PHASE 5: LLM GENERATION
         # ═══════════════════════════════════════════════════════════════
         yield {
             "type": "phase",
@@ -762,19 +790,11 @@ class GroqGenerator(CustomQueryEngine):
             "message": "✨ Generating response..."
         }
         
-        # Prepare context
-        text_context = []
-        image_paths = []
-        for node in all_nodes:
-            if isinstance(node.node, ImageNode) or 'image_path' in node.metadata:
-                img_path = node.metadata.get('image_path')
-                if img_path:
-                    image_paths.append(img_path)
-            else:
-                text_context.append(node.get_content())
+        # Prepare context using shared helper
+        text_context, image_paths = self._separate_nodes(all_nodes)
+        messages = await self._construct_messages(query_str, text_context, image_paths)
         
-        messages = self._construct_messages(query_str, text_context, image_paths)
-        
+        full_response_text = ""
         try:
             stream = await self.aclient.chat.completions.create(
                 model=self.model_name,
@@ -784,7 +804,6 @@ class GroqGenerator(CustomQueryEngine):
                 stream=True
             )
             
-            full_response_text = ""
             async for chunk in stream:
                 content = chunk.choices[0].delta.content
                 if content:
@@ -811,29 +830,18 @@ class GroqGenerator(CustomQueryEngine):
         # ═══════════════════════════════════════════════════════════════
         sources = []
         for node in all_nodes:
-            # Access metadata from the inner node (NodeWithScore wraps the actual node)
             metadata = node.node.metadata if hasattr(node, 'node') else (node.metadata if hasattr(node, 'metadata') else {})
             node_type = "image" if "image_path" in metadata else "text"
             
-            score = node.score or 0.0
-            
             sources.append({
                 "content": node.get_content()[:500] if hasattr(node, 'get_content') else node.node.get_content()[:500],
-                "score": score,
+                "score": node.score or 0.0,
                 "type": node_type,
                 "metadata": dict(metadata) if metadata else {}
             })
         
         # Store in semantic cache
-        try:
-            await self.retriever.qdrant_manager.store_response_cache(
-                query_embedding=query_embedding,
-                query_text=query_str,
-                response_text=full_response_text,
-                sources=sources
-            )
-        except Exception as e:
-            print(f"   [WARN] Cache store failed: {e}")
+        await self._store_response_cache(query_embedding, query_str, full_response_text, all_nodes)
         
         total_time = (time.perf_counter() - start_time) * 1000
         
@@ -844,102 +852,6 @@ class GroqGenerator(CustomQueryEngine):
         }
         
         yield {"type": "done", "total_duration_ms": total_time}
-    
-    async def astream_query(self, query_bundle: Union[str, QueryBundle]):
-        """
-        Async streaming version of query with live status updates and semantic cache.
-        
-        Yields tuples of (event_type, data, nodes):
-        - ("status", "Searching...", None) - Status update
-        - ("chunk", "text", nodes) - LLM response chunk
-        """
-        if isinstance(query_bundle, str):
-            query_bundle = QueryBundle(query_bundle)
-        
-        query_str = query_bundle.query_str
-        
-        # 1. Embed query (needed for cache check)
-        query_embedding = await self.retriever._get_cached_embedding(query_str)
-        
-        # 2. Check semantic cache
-        try:
-            cached = await self.retriever.qdrant_manager.search_response_cache(query_embedding)
-            if cached:
-                yield ("status", "⚡ Cache hit — returning cached response", None)
-                cached_response = cached.get("response", "")
-                # Emit in chunks to match the expected interface
-                for i in range(0, len(cached_response), 50):
-                    yield ("chunk", cached_response[i:i+50], [])
-                return
-        except Exception as e:
-            print(f"   [WARN] Cache check failed: {e}")
-        
-        # === Status: Searching ===
-        yield ("status", "🔍 Searching documents...", None)
-        
-        # 3. Retrieve
-        nodes: List[NodeWithScore] = await self.retriever._aretrieve(query_bundle)
-        
-        # === Status: Found nodes ===
-        text_count = sum(1 for n in nodes if 'image_path' not in n.metadata)
-        img_count = len(nodes) - text_count
-        yield ("status", f"📚 Found {text_count} text & {img_count} image sources", None)
-        
-        # 4. Prepare context
-        text_context = []
-        image_paths = []
-        for node in nodes:
-            if isinstance(node.node, ImageNode) or 'image_path' in node.metadata:
-                img_path = node.metadata.get('image_path')
-                if img_path:
-                    image_paths.append(img_path)
-            else:
-                text_context.append(node.get_content())
-        
-        # === Status: Generating ===
-        yield ("status", "✨ Generating response...", None)
-                
-        # 5. Construct Messages
-        messages = self._construct_messages(query_str, text_context, image_paths)
-        
-        # 6. Stream response + collect for cache
-        full_response_text = ""
-        try:
-            stream = await self.aclient.chat.completions.create(
-                model=self.model_name,
-                messages=messages,
-                temperature=config.LLM_TEMPERATURE,
-                max_tokens=config.LLM_MAX_NEW_TOKENS,
-                stream=True
-            )
-            
-            async for chunk in stream:
-                content = chunk.choices[0].delta.content
-                if content:
-                    full_response_text += content
-                    yield ("chunk", content, nodes)
-        except Exception as e:
-            yield ("chunk", f"Error: {e}", nodes)
-        
-        # 7. Store in semantic cache
-        try:
-            sources_for_cache = []
-            for node in nodes:
-                metadata = node.node.metadata if hasattr(node, 'node') else {}
-                sources_for_cache.append({
-                    "content": node.get_content()[:500],
-                    "score": node.score or 0.0,
-                    "type": "image" if "image_path" in metadata else "text",
-                    "metadata": dict(metadata) if metadata else {}
-                })
-            await self.retriever.qdrant_manager.store_response_cache(
-                query_embedding=query_embedding,
-                query_text=query_str,
-                response_text=full_response_text,
-                sources=sources_for_cache
-            )
-        except Exception as e:
-            print(f"   [WARN] Cache store failed: {e}")
 
 
 # Convenience function to initialize the full pipeline
@@ -962,7 +874,7 @@ def create_query_engine(qdrant_url: Optional[str] = None) -> GroqGenerator:
     # Ensure semantic response cache collection exists
     # Non-fatal: if Qdrant is temporarily unreachable, continue without cache
     try:
-        q_manager.create_response_cache_collection(config.JINA_EMBED_DIMENSIONS)
+        q_manager.create_response_cache_collection(config.LOCAL_TEXT_DIMENSIONS)
     except Exception as e:
         print(f"[WARN] Response cache collection unavailable (will skip caching): {e}")
     
